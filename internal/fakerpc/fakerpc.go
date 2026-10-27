@@ -14,11 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/strkey"
+	"github.com/stellar/go-stellar-sdk/toid"
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
@@ -68,8 +70,9 @@ type Server struct {
 	// calls counts GetEvents/GetLedgers invocations.
 	calls int
 	// lastPage remembers what was served, for ReplayLast.
-	lastEvents  []protocol.EventInfo
-	lastLedgers []protocol.LedgerInfo
+	lastEvents       []protocol.EventInfo
+	lastLedgers      []protocol.LedgerInfo
+	lastTransactions []protocol.TransactionInfo
 
 	// tx maps a hash to a canned transaction response.
 	tx map[string]protocol.GetTransactionResponse
@@ -705,8 +708,14 @@ func (s *Server) GetTransactions(ctx context.Context, req protocol.GetTransactio
 	}
 
 	hasCursor := req.Pagination != nil && req.Pagination.Cursor != ""
+	// Mirror the real server's rule that a cursor and a ledger range are
+	// mutually exclusive.
+	if hasCursor && req.StartLedger != 0 {
+		return protocol.GetTransactionsResponse{}, errors.New("ledger ranges and cursor cannot both be set")
+	}
 
 	respond := func(page []protocol.TransactionInfo) protocol.GetTransactionsResponse {
+		s.lastTransactions = page
 		resp := protocol.GetTransactionsResponse{
 			Transactions: page,
 			LatestLedger: latest,
@@ -723,11 +732,23 @@ func (s *Server) GetTransactions(ctx context.Context, req protocol.GetTransactio
 	if b.Empty {
 		return respond(nil), nil
 	}
+	if b.ReplayLast {
+		return respond(s.lastTransactions), nil
+	}
+
+	var after int64 = -1
+	if hasCursor {
+		parsed, err := strconv.ParseInt(req.Pagination.Cursor, 10, 64)
+		if err != nil {
+			return protocol.GetTransactionsResponse{}, fmt.Errorf("bad cursor: %w", err)
+		}
+		after = parsed
+	}
 
 	var out []protocol.TransactionInfo
 	for _, tx := range s.transactions {
 		if hasCursor {
-			if transactionCursor(tx) > req.Pagination.Cursor {
+			if transactionToid(tx) > after {
 				out = append(out, tx)
 			}
 			continue
@@ -748,7 +769,14 @@ func (s *Server) GetTransactions(ctx context.Context, req protocol.GetTransactio
 }
 
 func transactionCursor(tx protocol.TransactionInfo) string {
-	return fmt.Sprintf("%010d-%06d", tx.Ledger, tx.ApplicationOrder)
+	return strconv.FormatInt(transactionToid(tx), 10)
+}
+
+// transactionToid returns the SEP-35 total-order position the real server
+// encodes in its cursor. Getting this shape right is what keeps cursor
+// parsing, gap detection and ordering tests honest.
+func transactionToid(tx protocol.TransactionInfo) int64 {
+	return toid.New(int32(tx.Ledger), tx.ApplicationOrder, 1).ToInt64() //nolint:gosec // test data
 }
 
 // GetLedgerEntries implements rpc.LedgerEntriesClient.

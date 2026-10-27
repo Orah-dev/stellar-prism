@@ -389,6 +389,17 @@ func (p *Pool) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerRes
 	})
 }
 
+// GetNetwork implements rpc.NetworkClient for a failover pool.
+func (p *Pool) GetNetwork(ctx context.Context) (protocol.GetNetworkResponse, error) {
+	return poolCall(p, ctx, "getNetwork", func(c rpc.Client) (protocol.GetNetworkResponse, error) {
+		network, ok := c.(rpc.NetworkClient)
+		if !ok {
+			return protocol.GetNetworkResponse{}, rpc.Permanent(fmt.Errorf("pooled endpoint does not implement NetworkClient"))
+		}
+		return network.GetNetwork(ctx)
+	})
+}
+
 // GetHealth implements rpc.HealthClient, so the health command works when
 // --rpc-url is repeated. Failover, cooldowns and permanent-error handling are
 // the same as for every other pooled call.

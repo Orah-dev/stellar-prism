@@ -64,7 +64,13 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **NDJSON for pipelines** | ❌ | ✅ |
 | **Per-contract fan-out** | ❌ | ✅ (`--fanout-dir`) |
 | **Gap detection** | ❌ | ✅ |
+| **Active-passive HA** | ❌ | ✅ (`--ha-lease-file`) |
+| **Health/readiness probes** | ❌ | ✅ (`--health-port`) |
+| **Runtime pprof profiles** | ❌ | ✅ (`--pprof-port`) |
+| **Graceful drain on SIGTERM** | ❌ | ✅ (`--drain-timeout`) |
+| **Encrypted state file** | ❌ | ✅ (`--state-passphrase-env`) |
 | Ledger streaming | ❌ | ✅ |
+| Database / Parquet ingestion | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
 
 ## Install
@@ -144,6 +150,60 @@ prism events --from 3966000 --limit 10000 --json --backfill-workers 4
 Workers fetch disjoint ledger ranges, then records are merged by ID before
 they reach stdout, so output order and de-duplication are unchanged.
 
+### Reprocessing with `--rewind`
+
+`--rewind` steps the start point back so the records in between are processed
+again — the manual way to reprocess what a stream just missed:
+
+```sh
+# Reprocess the last 500 ledgers, then keep following
+prism events --contract CDLZF...CYSC --rewind 500 --follow
+
+# Or by time: 30 minutes' worth of ledgers
+prism events --contract CDLZF...CYSC --rewind 30m --follow
+```
+
+The step is measured from `--from` when it is given, and from the server's
+head otherwise. While a stream is following, `SIGUSR2` asks for the same
+step again, which reprocesses the records between the old and the new
+position.
+
+A rewind re-emits the records it steps over, on purpose: that is what
+reprocessing means. A rewind that reaches past the server's ~24-hour
+retention window is reported as a gap and exits 2, like any other gap.
+
+### Auditing a stream
+
+`--sink-audit` writes a trail that shows whether it was changed after the
+fact. Every record is hashed together with the hash of the record before it:
+
+```
+Hash_n = SHA256(Hash_{n-1} + Record_n)
+```
+
+so editing, deleting or inserting a line changes every hash after it. A signed
+checkpoint is written every `--sink-audit-checkpoint` records (100 by default),
+which is what catches a trail that was edited and re-hashed from the beginning.
+The signing key is an Ed25519 private key at `--sink-audit-key`, or
+`<audit file>.key` when the flag is left out; it is created with mode `0600`
+the first time it is needed.
+
+```sh
+# Write a trail and check it later
+prism events --follow --sink-audit /var/log/prism/audit.log
+prism audit-verify /var/log/prism/audit.log
+
+# Pin the key the trail must be signed with, then verify against it
+prism audit-verify --print-public-key /var/log/prism/audit.log > prism.pub
+prism audit-verify --public-key prism.pub /var/log/prism/audit.log
+```
+
+`prism audit-verify` recomputes the chain, checks every signed checkpoint and
+names the line of every anomaly it finds. It exits 0 when the trail is intact
+and 1 when it was tampered with. The trail is append-only across runs: a new
+run continues the chain of the existing log and refuses to continue a log that
+was signed with a different key.
+
 ### NDJSON for pipelines
 
 `--json` emits one object per line, flushed after each record (or batch), so a
@@ -194,6 +254,130 @@ position it reached, and a page the `--limit` cut short is not reported at all.
 This narrows the restart window from "the whole run" to "one record". It is
 not exactly-once — see [What prism guarantees](#what-prism-guarantees).
 
+### Running two instances without duplicating records
+
+A single prism instance is a single point of failure, and two instances
+streaming the same contract produce duplicate downstream events and fight
+over the cursor file. `--ha-lease-file` makes the pair **active-passive**: one
+instance holds the lease and streams, the other waits and takes over if the
+leader stops.
+
+```sh
+# Both instances share the lease file; only the leader streams
+prism events --contract CDLZF... --follow \
+  --ha-lease-file /shared/nfs/prism.lock --ha-heartbeat 5s
+```
+
+The lease is a file lock plus a record of who holds it, kept beside the lock
+in `<path>.lease`:
+
+- The leader holds an exclusive `flock` on the lease file for its whole term,
+  and renews the lease every `--ha-heartbeat` (5s by default).
+- A standby watches for the lease to expire and takes it over. `--ha-ttl`
+  (15s by default) is how long a lease stays valid without a renewal; it must
+  be at least twice the heartbeat.
+- A crashed leader is replaced at once, because the kernel drops the lock when
+  the process dies. A leader that is alive but partitioned is replaced when
+  its lease expires.
+- Every handover bumps an **epoch**, the fencing token. A leader that was
+  fenced notices on its next renewal and stops, rather than continuing to
+  emit alongside the new leader.
+- A new leader resumes from the cursor the previous one committed, so the
+  takeover continues the stream instead of starting a second one.
+
+The lease file must live on a file system that supports advisory locking — a
+shared NFS mount, for instance — so every instance sees the same lock. On a
+platform without `flock`, prism refuses to start rather than pretending the
+lease works.
+
+A standby is alive but **not ready**: it is waiting for the lease, not
+serving, and it must not be sent traffic.
+
+### Health and readiness probes
+
+`--health-port` serves the endpoints a container orchestrator asks for:
+
+```sh
+prism events --contract CDLZF... --follow --health-port 8086 --max-lag 100
+```
+
+| Endpoint | Answers |
+|---|---|
+| `/healthz` | 200 while the process is running and making progress; 503 when the stream is stuck |
+| `/readyz` | 200 when the RPC is answering, the stream has not gapped, and the lag is within `--max-lag`; 503 otherwise |
+| `/metrics` | The same state in the Prometheus exposition format |
+
+`--max-lag` is how many ledgers the stream may be behind the server's head
+before it stops being ready; 0 means no limit. The lag is measured from the
+stream's own progress, so it is the real distance to the head and not a guess.
+
+A standby answers `/healthz` with 200 — it is waiting, not stuck — and
+`/readyz` with 503, so the orchestrator keeps traffic away from it.
+
+### Runtime profiling
+
+`--pprof-port` starts the Go runtime's profiling server on loopback for the
+lifetime of the command:
+
+```sh
+prism events --contract CDLZF... --follow --pprof-port 6060
+# prism: serving pprof on http://127.0.0.1:6060/debug/pprof/
+```
+
+Use `/debug/pprof/heap` and `/debug/pprof/allocs` for memory, or
+`/debug/pprof/profile?seconds=30` for CPU. The server binds to `127.0.0.1`
+because profiles expose memory and stack contents; it is shut down and its
+goroutine joined when the command exits, including on Ctrl-C.
+
+### Graceful drain
+
+Kubernetes gives a pod a grace period (30s by default) after SIGTERM before
+it sends SIGKILL. prism uses it:
+
+```sh
+prism events --contract CDLZF... --follow --drain-timeout 15s
+```
+
+On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls, then gives the
+sinks and the state store up to `--drain-timeout` (15s by default) to flush
+the records still in memory and commit the final cursor. It exits 0 when
+every flush confirmed success.
+
+A drain that overruns its deadline is reported rather than waited out: a
+process that is about to be killed cannot be helped by a longer flush. The
+records that were not delivered are re-emitted on the next run, because the
+cursor is only committed for pages that were actually delivered.
+
+### Encrypting the state file
+
+A cursor journal holds stream metadata, and on a shared file system or in a
+cloud bucket that is worth encrypting:
+
+```sh
+prism events --contract CDLZF... --follow \
+  --state-file state.enc --state-passphrase-env PRISM_STATE_KEY
+```
+
+The state file is encrypted with authenticated **AES-256-GCM**, and every
+update uses a fresh nonce. A file that was tampered with, truncated or
+written with a different key is rejected with a clear authentication error
+rather than being read as if it were intact.
+
+The key comes from exactly one place:
+
+| Flag | Key source |
+|---|---|
+| `--state-passphrase-env` | A passphrase in an environment variable |
+| `--state-passphrase-file` | A passphrase in a file |
+| `--state-kms-provider aws` + `--state-kms-key-id` | An AWS KMS key |
+| `--state-kms-provider gcp` + `--state-kms-key-id` | A GCP KMS key |
+
+With a key management service the data key is generated and wrapped by the
+service, so the plaintext key never reaches the disk. Passing more than one
+key source is an error rather than a silently ignored flag: an operator who
+believes the file is encrypted with a passphrase must never end up with a
+file encrypted with something else.
+
 ### `prism transactions` — successes, failures, traps and fee bumps
 
 Every transaction is classified as it streams: `status`, the account that
@@ -223,6 +407,13 @@ effective payer, so a muxed fee source resolves to its underlying account.
 The filters are applied after each page is fetched, so the cursor still
 advances across suppressed transactions — a filtered stream is a view of the
 transaction stream rather than a second stream that could skip history.
+
+Pagination uses the RPC's own SEP-35 paging token, so `--from` hands over to
+`--follow` at exactly the next transaction rather than at the next ledger. The
+page size is capped at 200 by the server (the default is 100, because each
+transaction carries three XDR blobs), and a page that stops short of the head
+keeps draining: the server limits how many ledgers one call scans, so a short
+page is not the end of a backfill.
 
 ```console
 $ prism transactions --status failed --limit 1 --json
@@ -268,6 +459,33 @@ $ prism ledgers --follow --compact
 2026-08-04T14:35:53Z  ledger 3966820  e68b8…0c1e
 ```
 
+### Fee market, contract lifecycle and trades
+
+```sh
+# Ledger fee market and moving transaction fee averages
+prism fee-stats --follow
+
+# Follow contract storage, TTL expiry and deployment or upgrade activity
+prism contracts --watch CDLZF...CYSC --follow
+
+# Stream completed classic path-payment executions
+prism trades --pair XLM/USDC --follow
+```
+
+`fee-stats` reports base fee and reserve, fee pool, circulating coins,
+Soroban resource fees, and rolling 10 and 50 ledger transaction fee averages.
+`contracts` reports ledger-key TTL and warns below 1,000 remaining ledgers;
+RPC does not associate TTL key hashes with contract IDs, so TTL changes are
+included even when `--watch` selects contracts. `trades` normalizes classic
+strict-send and strict-receive path payments from transaction results. It also
+recognizes Soroban swap events using `swap`, trader, input asset and output
+asset topics with input and output amounts in the event value. Soroban amounts
+remain raw token units because each contract defines its own decimal scale.
+
+Failed transaction streams include the transaction or operation result code
+inline, for example `failed at op 1 (payment): payment_underfunded`; NDJSON
+records carry `error_code` and `error_detail` fields.
+
 ### `prism operations` - stream transaction operations
 
 Deconstructs transaction envelopes into independently filterable records with
@@ -309,7 +527,8 @@ This is a streaming tool, so the guarantee matters more than the feature list:
 
 - **No duplicates within a run.** Cursor paging is exact, and every record is
   checked against the highest ID already emitted, so a page replayed after a
-  reconnect is suppressed.
+  reconnect is suppressed. A `--rewind` is the one exception: it deliberately
+  re-emits the records it steps over, which is what reprocessing means.
 - **A dropped connection cannot skip records.** A failed fetch is retried with
   the cursor *unchanged*.
 - **No silent gaps by default.** Records can only be genuinely lost by falling
@@ -379,12 +598,16 @@ before v1.0.
 - Event, ledger and transaction streams; `prism tx` via the lens explain path.
 - Count/time batching (`--batch`) and concurrent historical backfill
   (`--backfill-workers`).
+- `--rewind` to step a stream back and reprocess recent ledgers, by count or
+  by duration, while it runs.
 - Explicit gap policy: stop by default, or `--gap-strategy resume` with the
   skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,
   and `stellar events` is better for that today.
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue from it. Still not exactly-once across restarts.
+- Covered twice: by an offline suite with no network, and by an opt-in
+  end-to-end run against a local Quickstart network (`make test-e2e`).
 
 See [docs/roadmap.md](docs/roadmap.md).
 

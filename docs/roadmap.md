@@ -7,12 +7,17 @@ An honest account of where this is going. Dates are intentions, not commitments.
 Working and tested:
 
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
+- `prism transactions` — `getTransactions` with SEP-35 cursor continuity,
+  gap detection and classification; `--status`, `--trapped`, `--fee-bump`,
+  `--fee-account` and `--memo` are views of the same stream
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
 - `prism abi` — resolve a contract's WASM via RPC and render its embedded spec
 - `prism completion` and `prism gendocs` — shell completion and reference docs
 - `--color auto|always|never` honoring `NO_COLOR`
 - NDJSON on everything, flushed per record or per `--batch`
+- Optional webhook, S3/GCS, Prometheus and syslog/journald sinks, composed
+  with stdout through a fanout
 - `--from` backfill, draining full pages at network speed, optionally with
   `--backfill-workers`
 - `--since 10m` — relative windows converted to approximate start ledgers
@@ -24,7 +29,13 @@ Working and tested:
   `--gap-strategy resume` with the skipped range reported
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue a stream from the last recorded position
+- `--stats` — a run summary on exit: records processed, duplicates dropped,
+  retries and elapsed time
+- `--heartbeat 30s` — a line on stderr after every idle interval during
+  `--follow`, so a quiet contract is distinguishable from a hung process
 - Streaming core fully tested with no network, and mutation-checked
+- An opt-in end-to-end suite that runs prism against a local Quickstart
+  network (`make test-e2e`), including clean shutdown with no leaked goroutines
 
 Known limits, stated plainly:
 
@@ -57,6 +68,9 @@ Two smaller things could follow: recording the position per *ledger* rather
 than per page, and letting several streams share one state file without
 keying it by filter set.
 
+Until it exists, `--rewind` is the manual escape hatch: it steps a run back
+so recent records are reprocessed, by ledger count or by duration.
+
 ### Contract-spec-aware decoding
 
 The one place `stellar events` is clearly better. Given a contract's
@@ -68,27 +82,13 @@ cache it, or accept a local file) and belongs in `lens` rather than `prism`,
 since `lens decode` would benefit identically. Probably the highest-value item
 here, and the largest.
 
-### Transaction and operation streams
-
-`prism txs --follow` over `getTransactions`, which is already a paginated
-cursor API of the same shape. Mostly a new `Source`; the state machine and
-sinks are unchanged. A good first substantial contribution.
-
 ### Better `--follow` ergonomics
 
 - a heartbeat line on stderr when a follow is idle, so a quiet contract is
-  distinguishable from a hung process (the `--since` half of this list has
-  already shipped — see it in the working list above)
-- `--stats` on exit, reporting records emitted, duplicates suppressed and
-  retries
+  distinguishable from a hung process (the `--since` and `--stats` halves of
+  this list have already shipped — see them in the working list above)
 
 ## Later, and less certain
-
-### Alternative sinks
-
-The `Sink` seam makes these small: a file rotator, a webhook poster, an
-S3/GCS writer. Worth adding when someone actually needs one rather than
-speculatively — each adds configuration surface and failure modes.
 
 ### Horizon as a second backend
 
@@ -96,15 +96,11 @@ Horizon offers SSE streaming for classic operations, which would genuinely be
 push rather than polling. It is a different API shape and a different data
 model, so it would be a second `Source` family rather than a drop-in.
 
-### Prometheus metrics
-
-Only if prism becomes something people run as a daemon. A CLI that exits does
-not need a metrics endpoint.
-
 ## Explicitly not planned
 
-- **Indexing or storage.** prism streams and exits. Mercury and Zephyr are
-  hosted indexers; if you need queryable history, use one of those.
+- **Indexing.** prism can write records to PostgreSQL/TimescaleDB or Parquet,
+  but it does not index, query or serve them. Mercury and Zephyr remain the
+  hosted indexers; prism's sinks are for the store you already run.
 - **Transaction submission or signing.** prism reads. It never handles secret
   keys, and adding that would make an inspection tool security-sensitive.
 - **Reimplementing XDR decoding.** That is

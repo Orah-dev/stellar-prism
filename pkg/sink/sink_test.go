@@ -154,6 +154,29 @@ func TestNDJSONSurvivesUndecodablePayload(t *testing.T) {
 	}
 }
 
+func TestTransactionFailureIsStructuredAndReadable(t *testing.T) {
+	index := uint32(1)
+	record := stream.Record{ID: "0000000100-0001", Sequence: 100, Kind: stream.KindTransaction, Transaction: &stream.Transaction{Hash: "abcdef", Successful: false, ErrorCode: "payment_underfunded", FailureReason: "payment underfunded", FailedOpIndex: &index, FailedOpType: "payment"}}
+	var jsonOut bytes.Buffer
+	if err := sink.NewNDJSON(&jsonOut, false).Emit(record); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(jsonOut.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["error_code"] != "payment_underfunded" || fields["error_detail"] != "payment underfunded" || fields["failedOpIndex"] != float64(1) {
+		t.Fatalf("failure fields = %#v", fields)
+	}
+	var humanOut bytes.Buffer
+	if err := sink.NewHuman(&humanOut, lensformat.NoColor, true).Emit(record); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(humanOut.String(), "failed at op 1 (payment): payment_underfunded") {
+		t.Fatalf("human output lacks failure explanation: %s", humanOut.String())
+	}
+}
+
 func TestNDJSONEmitsOneLinePerRecord(t *testing.T) {
 	t.Parallel()
 

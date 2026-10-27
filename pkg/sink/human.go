@@ -93,6 +93,35 @@ func (h *Human) emitRecord(r stream.Record) error {
 		if err := h.emitWASMDeployment(r); err != nil {
 			return err
 		}
+	case stream.KindFeeStats:
+		if r.FeeStats == nil {
+			return fmt.Errorf("human: fee stats record %s has no payload", r.ID)
+		}
+		f := r.FeeStats
+		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  base fee %d stroops  base reserve %d stroops  fee pool %d  coins %d  avg fee 10/50 %.2f/%.2f  tx %d  Soroban resource/bid %d/%d\n", formatTime(r.Time), r.Sequence, f.BaseFee, f.BaseReserve, f.FeePool, f.CoinsInCirculation, f.AverageFee10, f.AverageFee50, f.Transactions, f.SorobanResourceFee, f.SorobanFeeBid); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	case stream.KindTrade:
+		if r.Trade == nil {
+			return fmt.Errorf("human: trade record %s has no payload", r.ID)
+		}
+		t := r.Trade
+		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  %s %s  %s %s -> %s %s  price %s  trader %s", formatTime(r.Time), r.Sequence, t.Protocol, t.Operation, t.AmountIn, t.AssetIn, t.AmountOut, t.AssetOut, t.Price, t.Trader); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		if t.Maker != "" {
+			if _, err := fmt.Fprintf(h.w, "  maker %s", t.Maker); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		if t.AmountUnit != "" {
+			if _, err := fmt.Fprintf(h.w, "  (%s)", t.AmountUnit); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		if _, err := h.w.WriteString("\n"); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
 	case stream.KindOperation:
 		if err := h.emitOperation(r); err != nil {
 			return err
@@ -279,6 +308,17 @@ func (h *Human) emitTransaction(r stream.Record) error {
 	)
 	if !t.Successful {
 		fmt.Fprintf(&b, "  %sfailed%s", p.Remove, p.Reset)
+		if t.FailedOpIndex != nil {
+			fmt.Fprintf(&b, " at op %d", *t.FailedOpIndex)
+			if t.FailedOpType != "" {
+				fmt.Fprintf(&b, " (%s)", t.FailedOpType)
+			}
+		}
+		if t.ErrorCode != "" {
+			fmt.Fprintf(&b, ": %s", t.ErrorCode)
+		} else if t.FailureReason != "" {
+			fmt.Fprintf(&b, ": %s", t.FailureReason)
+		}
 	}
 	if t.Failure.Trapped() {
 		fmt.Fprintf(&b, "  %strapped%s", p.Remove, p.Reset)
@@ -432,6 +472,12 @@ func (h *Human) emitStorageChange(r stream.Record) error {
 	}
 	if c.KeyHash != "" {
 		fmt.Fprintf(&b, "  %skey %s%s", p.Dim, shorten(c.KeyHash), p.Reset)
+	}
+	if c.EntryType == "ttl" && c.LiveUntilLedger > 0 {
+		fmt.Fprintf(&b, "  live until %d (%d ledgers)", c.LiveUntilLedger, c.RemainingTTL)
+		if c.TTLWarning {
+			fmt.Fprintf(&b, "  %sTTL WARNING%s", p.Remove, p.Reset)
+		}
 	}
 	b.WriteString("\n")
 

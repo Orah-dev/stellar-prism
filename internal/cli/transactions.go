@@ -43,6 +43,9 @@ Filtering happens after each page is fetched, so the cursor still advances
 across suppressed records: a filtered stream is a view of the transaction
 stream, not a second stream that could skip history.
 
+With --pg-dsn the position is committed to PostgreSQL as the stream advances,
+so an interrupted run resumes where it stopped.
+
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
 start the next run where the last one stopped.`,
@@ -118,6 +121,7 @@ start the next run where the last one stopped.`,
 					Filters:     filters,
 				})
 			}
+			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))
 			if detectConflicts {
 				analyzer := stream.NewFootprintAnalyzer()
 				sf.process = analyzer.Analyze

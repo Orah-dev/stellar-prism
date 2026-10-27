@@ -76,6 +76,12 @@ func NewWASMSource(client rpc.Client, q WASMQuery) (*WASMSource, error) {
 // Name implements Source.
 func (s *WASMSource) Name() string { return "wasm_deployments" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *WASMSource) Rewind(ledger uint32) {
+	s.cfg.StartLedger = ledger
+	s.tx.Rewind(ledger)
+}
+
 // CursorLedger implements Source.
 func (s *WASMSource) CursorLedger(cursor string) (uint32, bool) {
 	return s.tx.CursorLedger(cursor)
@@ -211,6 +217,28 @@ func (s *WASMSource) hostFunctionEvent(fn *xdr.HostFunction) (*WASMEvent, bool, 
 			return nil, false, fmt.Errorf("create-v2 host function has no arguments")
 		}
 		return s.createEvent(args.ContractIdPreimage, args.Executable)
+
+	case xdr.HostFunctionTypeHostFunctionTypeInvokeContract:
+		args := fn.InvokeContract
+		if args == nil || string(args.FunctionName) != "update_wasm" {
+			return nil, false, nil
+		}
+		contract, ok := args.ContractAddress.GetContractId()
+		if !ok {
+			return nil, false, fmt.Errorf("update_wasm target is not a contract")
+		}
+		contractID, err := strkey.Encode(strkey.VersionByteContract, contract[:])
+		if err != nil {
+			return nil, false, fmt.Errorf("encoding contract address: %w", err)
+		}
+		if len(args.Args) == 0 {
+			return nil, false, fmt.Errorf("update_wasm has no wasm hash argument")
+		}
+		hash, ok := args.Args[0].GetBytes()
+		if !ok || len(hash) != 32 {
+			return nil, false, fmt.Errorf("update_wasm has invalid wasm hash")
+		}
+		return &WASMEvent{Action: "upgrade", ContractID: contractID, WASMHash: hex.EncodeToString(hash)}, true, nil
 
 	default:
 		return nil, false, nil

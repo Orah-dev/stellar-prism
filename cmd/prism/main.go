@@ -29,7 +29,7 @@ import (
 
 func main() {
 	cli.InitSIGQUIT()
-	err := cli.Execute(os.Args[1:], os.Stdout, os.Stderr)
+	err := cli.ExecuteWithProfiler(os.Args[1:], os.Stdout, os.Stderr, newPProfProfiler)
 	code, printable := cli.ExitCode(err)
 	if printable {
 		fmt.Fprintln(os.Stderr, "prism:", err)

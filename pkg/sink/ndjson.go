@@ -102,6 +102,10 @@ type transactionLine struct {
 	FeeAccount    string                `json:"feeAccount,omitempty"`
 	FeeBump       *feeBumpLine          `json:"feeBump,omitempty"`
 	Failure       *failureLine          `json:"failure,omitempty"`
+	ErrorCode     string                `json:"error_code,omitempty"`
+	ErrorDetail   string                `json:"error_detail,omitempty"`
+	FailedOpIndex *uint32               `json:"failedOpIndex,omitempty"`
+	FailedOpType  string                `json:"failedOpType,omitempty"`
 	Envelope      json.RawMessage       `json:"envelope,omitempty"`
 	Result        json.RawMessage       `json:"result,omitempty"`
 	ResultMeta    json.RawMessage       `json:"resultMeta,omitempty"`
@@ -191,22 +195,25 @@ type feeBumpLine struct {
 
 // storageChangeLine is the documented NDJSON shape for a storage mutation.
 type storageChangeLine struct {
-	Kind       string          `json:"kind"`
-	ID         string          `json:"id"`
-	Ledger     uint32          `json:"ledger"`
-	Time       string          `json:"time,omitempty"`
-	ChangeType string          `json:"changeType,omitempty"`
-	EntryType  string          `json:"entryType,omitempty"`
-	ContractID string          `json:"contract,omitempty"`
-	Durability string          `json:"durability,omitempty"`
-	KeyHash    string          `json:"keyHash,omitempty"`
-	WASMHash   string          `json:"wasmHash,omitempty"`
-	Key        json.RawMessage `json:"key,omitempty"`
-	Entry      json.RawMessage `json:"entry,omitempty"`
-	Change     json.RawMessage `json:"change,omitempty"`
-	KeyXDR     string          `json:"keyXdr,omitempty"`
-	EntryXDR   string          `json:"entryXdr,omitempty"`
-	ChangeXDR  string          `json:"changeXdr,omitempty"`
+	Kind            string          `json:"kind"`
+	ID              string          `json:"id"`
+	Ledger          uint32          `json:"ledger"`
+	Time            string          `json:"time,omitempty"`
+	ChangeType      string          `json:"changeType,omitempty"`
+	EntryType       string          `json:"entryType,omitempty"`
+	ContractID      string          `json:"contract,omitempty"`
+	Durability      string          `json:"durability,omitempty"`
+	KeyHash         string          `json:"keyHash,omitempty"`
+	WASMHash        string          `json:"wasmHash,omitempty"`
+	Key             json.RawMessage `json:"key,omitempty"`
+	Entry           json.RawMessage `json:"entry,omitempty"`
+	Change          json.RawMessage `json:"change,omitempty"`
+	KeyXDR          string          `json:"keyXdr,omitempty"`
+	EntryXDR        string          `json:"entryXdr,omitempty"`
+	ChangeXDR       string          `json:"changeXdr,omitempty"`
+	LiveUntilLedger uint32          `json:"liveUntilLedger,omitempty"`
+	RemainingTTL    uint32          `json:"remainingTtl,omitempty"`
+	TTLWarning      bool            `json:"ttlWarning,omitempty"`
 }
 
 // wasmLine is the documented NDJSON shape for a deployment host function.
@@ -245,19 +252,31 @@ func (n *NDJSON) EmitBatch(records []stream.Record) error {
 }
 
 func (n *NDJSON) encode(r stream.Record) error {
+	payload, err := n.document(r)
+	if err != nil {
+		return err
+	}
+	if err := n.enc.Encode(payload); err != nil {
+		return fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
+	}
+	return nil
+}
+
+// document builds the JSON shape for one record.
+func (n *NDJSON) document(r stream.Record) (any, error) {
 	var payload any
 
 	switch r.Kind {
 	case stream.KindEvent:
 		line := eventLine{
-			Kind:    string(r.Kind),
-			ID:      r.ID,
-			Ledger:  r.Sequence,
-			Time:    formatTime(r.Time),
-			TxIndex: r.Event.TxIndex,
-			OpIndex: r.Event.OpIndex,
+			Kind:   string(r.Kind),
+			ID:     r.ID,
+			Ledger: r.Sequence,
+			Time:   formatTime(r.Time),
 		}
 		if r.Event != nil {
+			line.TxIndex = r.Event.TxIndex
+			line.OpIndex = r.Event.OpIndex
 			line.Type = r.Event.Type
 			line.ContractID = r.Event.ContractID
 			line.TxHash = r.Event.TxHash
@@ -269,14 +288,14 @@ func (n *NDJSON) encode(r stream.Record) error {
 				for _, t := range r.Event.TopicXDR {
 					raw, err := n.decodeXDR(t)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Topics = append(line.Topics, raw)
 				}
 				if r.Event.ValueXDR != "" {
 					raw, err := n.decodeXDR(r.Event.ValueXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Value = raw
 				}
@@ -300,7 +319,7 @@ func (n *NDJSON) encode(r stream.Record) error {
 			if n.decode && r.Close.MetadataXDR != "" {
 				raw, err := n.decodeXDR(r.Close.MetadataXDR)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				line.Metadata = raw
 			} else {
@@ -328,6 +347,10 @@ func (n *NDJSON) encode(r stream.Record) error {
 			}
 			line.Index = r.Transaction.Index
 			line.Successful = r.Transaction.Successful
+			line.ErrorCode = r.Transaction.ErrorCode
+			line.ErrorDetail = r.Transaction.FailureReason
+			line.FailedOpIndex = r.Transaction.FailedOpIndex
+			line.FailedOpType = r.Transaction.FailedOpType
 			line.Status = r.Transaction.Status
 			line.FeeAccount = r.Transaction.FeeAccount
 			line.FeeBump = feeBumpLineOf(r.Transaction.FeeBump)
@@ -336,21 +359,21 @@ func (n *NDJSON) encode(r stream.Record) error {
 				if r.Transaction.EnvelopeXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.EnvelopeXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Envelope = raw
 				}
 				if r.Transaction.ResultXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.ResultXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Result = raw
 				}
 				if r.Transaction.ResultMetaXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.ResultMetaXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.ResultMeta = raw
 				}
@@ -375,14 +398,14 @@ func (n *NDJSON) encode(r stream.Record) error {
 				if op.ParametersXDR != "" {
 					raw, err := n.decodeXDR(op.ParametersXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Parameters = raw
 				}
 				if op.ResultXDR != "" {
 					raw, err := n.decodeXDR(op.ResultXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Result = raw
 				}
@@ -401,7 +424,7 @@ func (n *NDJSON) encode(r stream.Record) error {
 			if n.decode && sim.ReturnValueXDR != "" {
 				raw, err := n.decodeXDR(sim.ReturnValueXDR)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				line.ReturnValue = raw
 			} else {
@@ -424,25 +447,28 @@ func (n *NDJSON) encode(r stream.Record) error {
 			line.Durability = c.Durability
 			line.KeyHash = c.KeyHash
 			line.WASMHash = c.WASMHash
+			line.LiveUntilLedger = c.LiveUntilLedger
+			line.RemainingTTL = c.RemainingTTL
+			line.TTLWarning = c.TTLWarning
 			if n.decode {
 				if c.KeyXDR != "" {
 					raw, err := n.decodeXDR(c.KeyXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Key = raw
 				}
 				if c.EntryXDR != "" {
 					raw, err := n.decodeXDR(c.EntryXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Entry = raw
 				}
 				if c.ChangeXDR != "" {
 					raw, err := n.decodeXDR(c.ChangeXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Change = raw
 				}
@@ -473,14 +499,59 @@ func (n *NDJSON) encode(r stream.Record) error {
 		}
 		payload = line
 
+	case stream.KindFeeStats:
+		if r.FeeStats == nil {
+			return nil, fmt.Errorf("ndjson: fee stats record %s has no payload", r.ID)
+		}
+		line := struct {
+			Kind   string `json:"kind"`
+			ID     string `json:"id"`
+			Ledger uint32 `json:"ledger"`
+			Time   string `json:"time,omitempty"`
+			*stream.FeeStats
+		}{Kind: string(r.Kind), ID: r.ID, Ledger: r.Sequence, Time: formatTime(r.Time), FeeStats: r.FeeStats}
+		payload = line
+
+	case stream.KindTrade:
+		if r.Trade == nil {
+			return nil, fmt.Errorf("ndjson: trade record %s has no payload", r.ID)
+		}
+		line := struct {
+			Kind   string `json:"kind"`
+			ID     string `json:"id"`
+			Ledger uint32 `json:"ledger"`
+			Time   string `json:"time,omitempty"`
+			*stream.Trade
+		}{Kind: string(r.Kind), ID: r.ID, Ledger: r.Sequence, Time: formatTime(r.Time), Trade: r.Trade}
+		payload = line
+
 	default:
-		return fmt.Errorf("ndjson: unknown record kind %q", r.Kind)
+		return nil, fmt.Errorf("ndjson: unknown record kind %q", r.Kind)
 	}
 
-	if err := n.enc.Encode(payload); err != nil {
-		return fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
+	return payload, nil
+}
+
+// EncodeRecord renders one record as the same JSON document NDJSON emits,
+// without the newline framing. Broker sinks use it as the message body, so a
+// Kafka or AMQP consumer sees exactly what `prism --json` would have printed.
+func EncodeRecord(r stream.Record, decode bool) ([]byte, error) {
+	n := &NDJSON{
+		decode:  decode,
+		lensFmt: lensformat.NewJSONFormatter(lensformat.WithIndent("")),
 	}
-	return nil
+	payload, err := n.document(r)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		return nil, fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // feeBumpLineOf converts a classification to its wire shape, or returns nil

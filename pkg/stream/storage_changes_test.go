@@ -234,6 +234,9 @@ func TestStorageChangeSourceExtractsContractEntries(t *testing.T) {
 	if ttl.KeyHash == "" {
 		t.Error("ttl record is missing the key hash")
 	}
+	if ttl.LiveUntilLedger != 500 || ttl.RemainingTTL != 377 || !ttl.TTLWarning {
+		t.Errorf("ttl expiration = live until %d, remaining %d, warning %v; want 500, 377, true", ttl.LiveUntilLedger, ttl.RemainingTTL, ttl.TTLWarning)
+	}
 }
 
 func TestStorageChangeSourceFilters(t *testing.T) {

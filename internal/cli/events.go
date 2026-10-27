@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,11 +26,16 @@ type streamFlags struct {
 	follow           bool
 	from             uint32
 	since            time.Duration
+	rewind           string
 	limit            int
 	asJSON           bool
+	format           string
+	csvFields        string
+	tsv              bool
 	raw              bool
 	compact          bool
 	poll             time.Duration
+	heartbeat        time.Duration
 	pageSize         uint
 	retries          int
 	adaptive         bool
@@ -39,10 +45,35 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
-	quiet            bool
-	verbosity        int
-	process          func([]stream.Record) ([]stream.Record, error)
-	filter           stream.RecordFilter
+	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
+	// to the environment default resolved in runStream.
+	pgDSN string
+	// pgCursorKey overrides the derived cursor row name.
+	pgCursorKey string
+	// derivedKey is computed by each command from its own query before
+	// runStream, because only the command knows which filters select records.
+	// See cursorKey.
+	derivedKey string
+
+	// Broker output. When configured, records are published to the broker
+	// instead of written to stdout.
+	kafkaBrokers     []string
+	kafkaTopic       string
+	kafkaPartitionBy string
+	amqpURL          string
+	amqpQueue        string
+	amqpExchange     string
+	amqpRoutingKey   string
+
+	quiet     bool
+	verbosity int
+	stats     bool
+	dryRun    bool
+	statsBar  bool
+	process   func([]stream.Record) ([]stream.Record, error)
+	filter    stream.RecordFilter
+
+	sinks sinkFlags
 
 	output         string
 	rotateSize     int64
@@ -56,9 +87,46 @@ type streamFlags struct {
 	pruneKeep     int
 	pruneMaxAge   time.Duration
 
+	// statePassphraseEnv names the environment variable holding the
+	// passphrase that encrypts the state file.
+	statePassphraseEnv string
+	// statePassphraseFile names the file holding the passphrase that
+	// encrypts the state file.
+	statePassphraseFile string
+	// stateKMSProvider is "aws" or "gcp": the key management service that
+	// holds the key of the state file.
+	stateKMSProvider string
+	// stateKMSKeyID identifies the key in the key management service.
+	stateKMSKeyID string
+	// stateKMSRegion is the region of the AWS key.
+	stateKMSRegion string
+	// stateKMSTokenEnv names the environment variable holding the token
+	// used to reach the GCP key service.
+	stateKMSTokenEnv string
+
+	// haLeaseFile is the lease file of the active-passive election. When
+	// it is set, only the instance holding the lease streams.
+	haLeaseFile string
+	// haHeartbeat is how often the leader renews the lease.
+	haHeartbeat time.Duration
+	// haTTL is how long the lease stays valid without a renewal.
+	haTTL time.Duration
+
+	// healthPort is the port the liveness and readiness probes are served
+	// on. Zero leaves them off.
+	healthPort int
+	// maxLag is how many ledgers the stream may be behind before it stops
+	// being ready.
+	maxLag uint32
+
+	// drainTimeout bounds how long a shutdown may take to flush the
+	// records in memory and commit the final cursor.
+	drainTimeout time.Duration
+
 	// dlqFile is the optional dead letter queue. When set, records that fail
 	// validation or delivery are written there instead of stopping the run.
-	dlqFile string
+	dlqFile          string
+	maxRecordRetries int
 
 	// stateKey identifies this stream inside the cursor metadata file. Two
 	// runs share a key only when they watch the same thing, so a recorded
@@ -73,6 +141,16 @@ type streamFlags struct {
 	// dedupWindow is the events-only re-poll de-duplicator window. Zero
 	// disables it.
 	dedupWindow int
+
+	// sampleRate is the fraction of events to keep (0.0 to 1.0). Zero disables sampling.
+	sampleRate float64
+	// maxRate is the maximum number of events per second to emit. Zero disables rate limiting.
+	maxRate float64
+
+	// excludeTopics are topic patterns to exclude (base64 ScVal or symbol string).
+	excludeTopics []string
+	// excludeContracts are contract IDs to exclude.
+	excludeContracts []string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -82,20 +160,31 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"start from this ledger and continue forward (default: the latest ledger)")
 	cmd.Flags().DurationVar(&s.since, "since", 0,
 		"start about this long ago, e.g. --since 10m; converted to an approximate start ledger (mutually exclusive with --from)")
+	cmd.Flags().StringVar(&s.rewind, "rewind", "",
+		"step back from the start point and reprocess those records: a ledger count (500) or a duration (30m); while following, SIGUSR2 steps back again")
 	cmd.Flags().IntVarP(&s.limit, "limit", "n", 0,
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
 		"emit NDJSON, one record per line")
+	cmd.Flags().StringVar(&s.format, "format", "", "output format: csv or tsv (default is human-readable; --json remains supported)")
+	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: id,ledger,time,kind,contract,tx,topic0,value")
+	cmd.Flags().BoolVar(&s.tsv, "tsv", false, "write tab-separated output (equivalent to --format tsv)")
 	cmd.Flags().BoolVar(&s.raw, "raw", false,
 		"leave XDR base64-encoded instead of decoding it")
 	cmd.Flags().BoolVar(&s.compact, "compact", false,
 		"print only the header line for each record, omitting decoded payloads")
 	cmd.Flags().DurationVar(&s.poll, "poll", stream.DefaultPollInterval,
 		"how long to wait between polls once caught up")
+	cmd.Flags().DurationVar(&s.heartbeat, "heartbeat", 0,
+		"print a line on stderr after this long waiting in silence (with --follow; 0 disables)")
 	cmd.Flags().UintVar(&s.pageSize, "page-size", defaultPage,
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
+		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
+		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
 		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
 	cmd.Flags().IntVar(&s.backfillWorkers, "backfill-workers", 1,
@@ -112,6 +201,12 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
 	cmd.Flags().BoolVar(&s.quiet, "quiet", false,
 		"suppress diagnostic output on stderr; only emit final exit code")
+	cmd.Flags().BoolVar(&s.stats, "stats", false,
+		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
+	cmd.Flags().BoolVar(&s.dryRun, "dry-run", false,
+		"validate filters and report matches without writing to configured sinks")
+	cmd.Flags().BoolVar(&s.statsBar, "stats-bar", false,
+		"show live ledger timing and ingest statistics on stderr (with --follow and a terminal stdout)")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
@@ -132,8 +227,50 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep at most this many cursor metadata entries per stream (0 keeps all)")
 	cmd.Flags().DurationVar(&s.pruneMaxAge, "prune-max-age", 0,
 		"drop cursor metadata entries older than this (0 keeps entries regardless of age)")
+	cmd.Flags().StringVar(&s.statePassphraseEnv, "state-passphrase-env", "",
+		"encrypt the state file with a passphrase read from this environment variable")
+	cmd.Flags().StringVar(&s.statePassphraseFile, "state-passphrase-file", "",
+		"encrypt the state file with a passphrase read from this file")
+	cmd.Flags().StringVar(&s.stateKMSProvider, "state-kms-provider", "",
+		`encrypt the state file with a key management service: "aws" or "gcp"`)
+	cmd.Flags().StringVar(&s.stateKMSKeyID, "state-kms-key-id", "",
+		"the key to use in the key management service (an ARN for AWS, a resource name for GCP)")
+	cmd.Flags().StringVar(&s.stateKMSRegion, "state-kms-region", "",
+		"region of the AWS key (default us-east-1, else $AWS_REGION)")
+	cmd.Flags().StringVar(&s.stateKMSTokenEnv, "state-kms-token-env", gcsTokenEnvVar,
+		"environment variable holding the OAuth token used to reach the GCP key service")
+	cmd.Flags().StringVar(&s.haLeaseFile, "ha-lease-file", "",
+		"run as an active-passive pair, taking this lease file as the lock; only the leader streams")
+	cmd.Flags().DurationVar(&s.haHeartbeat, "ha-heartbeat", stream.DefaultHAHeartbeat,
+		"how often the leader renews the lease")
+	cmd.Flags().DurationVar(&s.haTTL, "ha-ttl", stream.DefaultHATTL,
+		"how long the lease stays valid without a renewal")
+	cmd.Flags().IntVar(&s.healthPort, "health-port", 0,
+		"serve /healthz, /readyz and /metrics on this port (0 disables the health server)")
+	cmd.Flags().Uint32Var(&s.maxLag, "max-lag", 0,
+		"ledgers the stream may be behind before /readyz reports a failure (0 means no limit)")
+	cmd.Flags().DurationVar(&s.drainTimeout, "drain-timeout", DefaultDrainTimeout,
+		"how long a shutdown may take to flush records and commit the final cursor")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
+	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
+		"retry a failed record this many times before writing it to the dead-letter queue")
+	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
+		"Kafka broker addresses (comma-separated); requires --kafka-topic")
+	cmd.Flags().StringVar(&s.kafkaTopic, "kafka-topic", "",
+		"publish records as JSON to this Kafka topic instead of stdout; requires --kafka-brokers")
+	cmd.Flags().StringVar(&s.kafkaPartitionBy, "kafka-partition-by", string(sink.PartitionContract),
+		`Kafka message key: "contract" keeps one contract's records ordered on one partition, "tx" keys by transaction hash, "record" keys by record ID`)
+	cmd.Flags().StringVar(&s.amqpURL, "amqp-url", "",
+		"AMQP 0-9-1 broker URL, e.g. amqp://guest:guest@localhost:5672/; requires --amqp-queue")
+	cmd.Flags().StringVar(&s.amqpQueue, "amqp-queue", "",
+		"declare this durable queue and publish records to it instead of stdout; requires --amqp-url")
+	cmd.Flags().StringVar(&s.amqpExchange, "amqp-exchange", "",
+		"AMQP exchange to publish to (default: the default exchange, routing by queue name)")
+	cmd.Flags().StringVar(&s.amqpRoutingKey, "amqp-routing-key", "",
+		"AMQP routing key (default: the queue name)")
+	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
+	s.sinks.register(cmd)
 }
 
 // validate checks the stream options before anything is fetched.
@@ -141,6 +278,22 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 // cmd is required: it is what tells an explicitly-set flag apart from one
 // that is merely carrying its default.
 func (s *streamFlags) validate(cmd *cobra.Command) error {
+	if err := s.sinks.validate(cmd); err != nil {
+		return err
+	}
+	format := strings.ToLower(s.format)
+	if format != "" && format != "csv" && format != "tsv" {
+		return fmt.Errorf(`invalid --format %q: want "csv" or "tsv"`, s.format)
+	}
+	if s.tsv && format != "" && format != "tsv" {
+		return fmt.Errorf("--tsv conflicts with --format csv")
+	}
+	if (format != "" || s.tsv || s.csvFields != "") && s.asJSON {
+		return fmt.Errorf("CSV/TSV output conflicts with --json")
+	}
+	if s.csvFields != "" && format == "" && !s.tsv {
+		return fmt.Errorf("--csv-fields requires --format csv or --format tsv")
+	}
 	if cmd.Flags().Changed("since") {
 		if s.from != 0 {
 			return fmt.Errorf("--from and --since are mutually exclusive; pass only one")
@@ -151,6 +304,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
+	}
+	if _, _, err := s.rewindDistance(); err != nil {
+		return err
 	}
 	if _, err := stream.ParseGapStrategy(s.gapStrategy); err != nil {
 		return err
@@ -174,11 +330,81 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
 	}
+	if s.sinks.auditFile != "" {
+		if s.output != "" && samePath(s.sinks.auditFile, s.output) {
+			return fmt.Errorf("--sink-audit must differ from --output-file")
+		}
+		if s.dlqFile != "" && samePath(s.sinks.auditFile, s.dlqFile) {
+			return fmt.Errorf("--sink-audit must differ from --dlq-file")
+		}
+	}
+	if s.maxRecordRetries < 0 {
+		return fmt.Errorf("--max-record-retries must not be negative")
+	}
+	if s.maxRecordRetries > 0 && s.dlqFile == "" {
+		return fmt.Errorf("--max-record-retries requires --dlq-file")
+	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
 	}
+	if s.sampleRate < 0 || s.sampleRate > 1 {
+		return fmt.Errorf("--sample-rate must be between 0.0 and 1.0")
+	}
+	if s.maxRate < 0 {
+		return fmt.Errorf("--max-rate must not be negative")
+	}
+	if s.heartbeat < 0 {
+		return fmt.Errorf("--heartbeat must not be negative")
+	}
+	if s.heartbeat > 0 && !s.follow {
+		return fmt.Errorf("--heartbeat requires --follow")
+	}
+	if s.statsBar && !s.follow {
+		return fmt.Errorf("--stats-bar requires --follow")
+	}
 	if err := s.validateState(cmd); err != nil {
 		return err
+	}
+	if err := s.validateRuntime(); err != nil {
+		return err
+	}
+	return s.validateBroker()
+}
+
+func (s *streamFlags) rewindDistance() (stream.RewindDistance, bool, error) {
+	if s.rewind == "" {
+		return stream.RewindDistance{}, false, nil
+	}
+	d, err := stream.ParseRewind(s.rewind)
+	if err != nil {
+		return stream.RewindDistance{}, false, fmt.Errorf("--rewind: %w", err)
+	}
+	return d, true, nil
+}
+
+// validateRuntime checks the high availability, health and drain options.
+//
+// A zero heartbeat or lease lifetime means "use the default", so it is
+// accepted rather than rejected: the election fills the documented defaults
+// in, and a caller that never set the flags gets the same behaviour as one
+// that set them to their default.
+func (s *streamFlags) validateRuntime() error {
+	if s.haHeartbeat < 0 {
+		return fmt.Errorf("--ha-heartbeat must not be negative")
+	}
+	if s.haTTL < 0 {
+		return fmt.Errorf("--ha-ttl must not be negative")
+	}
+	if s.haHeartbeat > 0 && s.haTTL > 0 && s.haTTL < 2*s.haHeartbeat {
+		// A lease that expires before the leader could renew it would be
+		// handed away while the leader was still working on it.
+		return fmt.Errorf("--ha-ttl must be at least twice --ha-heartbeat")
+	}
+	if s.healthPort < 0 || s.healthPort > 65535 {
+		return fmt.Errorf("--health-port must be between 0 and 65535")
+	}
+	if s.drainTimeout < 0 {
+		return fmt.Errorf("--drain-timeout must not be negative")
 	}
 	return nil
 }
@@ -208,6 +434,9 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 	if s.pruneMaxAge < 0 {
 		return fmt.Errorf("--prune-max-age must not be negative")
 	}
+	if err := s.validateStateEncryption(cmd); err != nil {
+		return err
+	}
 	if s.stateFile != "" {
 		return nil
 	}
@@ -215,6 +444,62 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 		return fmt.Errorf("--resume requires --state-file")
 	}
 	for _, name := range []string{"prune-interval", "prune-keep", "prune-max-age"} {
+		if cmd.Flags().Changed(name) {
+			return fmt.Errorf("--%s requires --state-file", name)
+		}
+	}
+	return nil
+}
+
+// validateStateEncryption checks the state file encryption options.
+//
+// The key comes from exactly one place, so asking for two of them is an
+// error rather than a silently ignored flag: an operator who believes the
+// file is encrypted with a passphrase must never end up with a file that is
+// encrypted with something else.
+func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
+	sources := 0
+	if s.statePassphraseEnv != "" {
+		sources++
+	}
+	if s.statePassphraseFile != "" {
+		sources++
+	}
+	if s.stateKMSProvider != "" {
+		sources++
+	}
+	if sources > 1 {
+		return fmt.Errorf("only one of --state-passphrase-env, --state-passphrase-file and --state-kms-provider may be given")
+	}
+	if s.stateKMSProvider != "" {
+		provider := strings.ToLower(s.stateKMSProvider)
+		if provider != "aws" && provider != "gcp" {
+			return fmt.Errorf(`invalid --state-kms-provider %q: want "aws" or "gcp"`, s.stateKMSProvider)
+		}
+		if s.stateKMSKeyID == "" {
+			return fmt.Errorf("--state-kms-provider requires --state-kms-key-id")
+		}
+	} else if s.stateKMSKeyID != "" {
+		return fmt.Errorf("--state-kms-key-id requires --state-kms-provider")
+	}
+	if s.stateKMSRegion != "" && s.stateKMSProvider == "" {
+		return fmt.Errorf("--state-kms-region requires --state-kms-provider")
+	}
+	if s.stateKMSTokenEnv != "" && cmd.Flags().Changed("state-kms-token-env") && s.stateKMSProvider == "" {
+		return fmt.Errorf("--state-kms-token-env requires --state-kms-provider")
+	}
+
+	if s.stateFile != "" {
+		return nil
+	}
+	for _, name := range []string{
+		"state-passphrase-env",
+		"state-passphrase-file",
+		"state-kms-provider",
+		"state-kms-key-id",
+		"state-kms-region",
+		"state-kms-token-env",
+	} {
 		if cmd.Flags().Changed(name) {
 			return fmt.Errorf("--%s requires --state-file", name)
 		}
@@ -232,11 +517,30 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 // underlying sink, so rotation still sees whole batches.
 func (s *streamFlags) newSink(
 	w io.Writer,
+	diagnostics io.Writer,
 	colorMode string,
 	onBatchError func(error),
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
+	if s.dryRun {
+		return sink.NewDryRunSink(diagnostics), nil
+	}
 	build := func(out io.Writer) stream.Sink {
+		format := strings.ToLower(s.format)
+		if s.tsv {
+			format = "tsv"
+		}
+		if format == "csv" || format == "tsv" {
+			fields := []string(nil)
+			if s.csvFields != "" {
+				fields = strings.Split(s.csvFields, ",")
+			}
+			csv, err := sink.NewCSVSink(out, sink.CSVOptions{Fields: fields, Delimiter: map[bool]rune{true: '\t', false: ','}[format == "tsv"]})
+			if err != nil {
+				return errorSink{err: err}
+			}
+			return csv
+		}
 		if s.asJSON {
 			return sink.NewNDJSON(out, !s.raw)
 		}
@@ -244,9 +548,22 @@ func (s *streamFlags) newSink(
 	}
 
 	var out stream.Sink
-	if s.output == "" {
+	switch {
+	case s.kafkaTopic != "":
+		k, err := s.newKafkaSink()
+		if err != nil {
+			return nil, err
+		}
+		out = k
+	case s.amqpQueue != "":
+		a, err := s.newAMQPSink()
+		if err != nil {
+			return nil, err
+		}
+		out = a
+	case s.output == "":
 		out = build(w)
-	} else {
+	default:
 		rotator, err := sink.NewFileRotator(s.output, build, sink.RotatorOptions{
 			MaxSize:    s.rotateSize,
 			MaxAge:     s.rotateInterval,
@@ -259,6 +576,13 @@ func (s *streamFlags) newSink(
 		out = rotator
 	}
 
+	base := out
+	out, err := s.sinks.addTo(base, !s.raw, onBatchError)
+	if err != nil {
+		closeSink(base)
+		return nil, err
+	}
+
 	var dlq *sink.DLQ
 	if s.dlqFile != "" {
 		file, err := os.OpenFile(s.dlqFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -268,8 +592,9 @@ func (s *streamFlags) newSink(
 		}
 
 		dlq, err = sink.NewDLQ(out, file, sink.DLQOptions{
-			CloseWriter:  true,
-			OnDeadLetter: onDeadLetter,
+			MaxRecordRetries: s.maxRecordRetries,
+			CloseWriter:      true,
+			OnDeadLetter:     onDeadLetter,
 		})
 		if err != nil {
 			_ = file.Close()
@@ -286,9 +611,25 @@ func (s *streamFlags) newSink(
 	batcher := stream.NewBatcher(out, stream.BatcherOptions{
 		MaxRecords: s.batchSize,
 		MaxDelay:   s.batchTimeout,
-		OnError:    onBatchError,
+		OnError: func(err error) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("sink")
+			}
+			onBatchError(err)
+		},
 	})
 	if dlq == nil {
+		// Batcher.Close flushes and stops its timer, but it does not close
+		// what it wraps: a broker connection underneath the batcher would
+		// outlive its last publish without this pairing.
+		if closer, ok := out.(io.Closer); ok {
+			return &closingSink{
+				Sink: batcher,
+				closeFn: func() error {
+					return errors.Join(batcher.Close(), closer.Close())
+				},
+			}, nil
+		}
 		return batcher, nil
 	}
 	// Batcher.Close stops its timer and flushes, but it does not close what it
@@ -300,6 +641,29 @@ func (s *streamFlags) newSink(
 			return errors.Join(batcher.Close(), dlq.Close())
 		},
 	}, nil
+}
+
+type errorSink struct{ err error }
+
+func (s errorSink) Emit(stream.Record) error { return s.err }
+func (s errorSink) Flush() error             { return s.err }
+
+// dryRunFilter reports records rejected before they reach DryRunSink, making
+// filter validation observable without enabling any configured delivery sink.
+type dryRunFilter struct {
+	next        stream.RecordFilter
+	diagnostics io.Writer
+}
+
+func (f dryRunFilter) Match(record stream.Record) (bool, error) {
+	matched, err := f.next.Match(record)
+	if err != nil {
+		return false, err
+	}
+	if !matched {
+		_, _ = fmt.Fprintf(f.diagnostics, "dry-run: reject id=%s ledger=%d kind=%s\n", record.ID, record.Sequence, record.Kind)
+	}
+	return matched, nil
 }
 
 // closingSink gives a wrapper without its own Close a teardown path. It is how
@@ -346,6 +710,10 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		Filter:       s.filter,
 		PollInterval: s.poll,
 		MaxRetries:   s.retries,
+		// DrainTimeout bounds the final flush, so a sink that cannot be
+		// written does not hold the process past the grace period an
+		// orchestrator gives it.
+		DrainTimeout: s.drainTimeout,
 		// Adaptive switches the follow loop to the adaptive poller. Its bounds
 		// stay zero so the tailer fills the documented defaults in; the CLI
 		// keeps its flag surface to one switch.
@@ -353,6 +721,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		GapStrategy:      strategy,
 		MaxGapRecoveries: s.maxGapRecoveries,
 		OnRetry: func(attempt int, delay time.Duration, err error) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("rpc")
+			}
 			if showAtLeast(attempt, s.verbosity) {
 				// Reconnection is reported on stderr so it never contaminates a
 				// piped NDJSON stream, and so a stalled tail explains itself
@@ -362,6 +733,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 			}
 		},
 		OnGap: func(event stream.GapEvent) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("gap")
+			}
 			if showAtLeast(1, s.verbosity) && event.Recovered {
 				fmt.Fprintf(stderr,
 					"prism: %v; recovering by resuming at ledger %d\n",
@@ -428,6 +802,9 @@ Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
 reports the missed ledger range and exits 2 rather than skipping silently.
 
+With --pg-dsn the position is committed to PostgreSQL after every record, so
+an interrupted run resumes where it stopped instead of starting over.
+
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
 start the next run where the last one stopped.`,
@@ -447,7 +824,16 @@ start the next run where the last one stopped.`,
   prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
 
   # Backfill from a ledger then keep following
-  prism events --from 1234567 --follow`,
+  prism events --from 1234567 --follow
+
+  # Resume across restarts with a durable cursor in PostgreSQL
+  prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
+
+  # Durable cursor: resume where the previous run stopped
+  prism events --contract CBGSB... --follow --state-file ./prism.state.json
+
+  # Reprocess the last 500 ledgers, then keep following
+  prism events --contract CBGSB... --rewind 500 --follow`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(cmd); err != nil {
@@ -514,8 +900,36 @@ start the next run where the last one stopped.`,
 				if watchlist != nil {
 					query.Watchlist = watchlist
 				}
-				return stream.NewEventSource(client, query)
+				var src stream.Source
+				src, err := stream.NewEventSource(client, query)
+				if err != nil {
+					return nil, err
+				}
+				if sf.sampleRate > 0 || sf.maxRate > 0 {
+					src = stream.NewSampleFilter(src, sf.sampleRate, sf.maxRate)
+				}
+				if len(sf.excludeTopics) > 0 || len(sf.excludeContracts) > 0 {
+					src, err = stream.NewExcludeFilter(src, sf.excludeTopics, sf.excludeContracts)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return src, nil
 			}
+
+			// The key names this exact query: same filters, same stream, and
+			// therefore the same durable position on a later run.
+			parts := []string{fromKeyPart(sf.from)}
+			for _, c := range contractIDs {
+				parts = append(parts, "contract="+c)
+			}
+			for _, topic := range topics {
+				parts = append(parts, "topic="+topic)
+			}
+			for _, et := range eventTypes {
+				parts = append(parts, "type="+et)
+			}
+			sf.derivedKey = cursorKey(cmd.Name(), parts...)
 
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
@@ -537,10 +951,18 @@ start the next run where the last one stopped.`,
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
 		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+	cmd.Flags().StringArrayVar(&sf.excludeTopics, "exclude-topic", nil,
+		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
+	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,
+		"contract ID to exclude; repeatable")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
 		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
+	cmd.Flags().Float64Var(&sf.sampleRate, "sample-rate", 0,
+		"fraction of matching events to emit deterministically (0.0 to 1.0; 0 disables)")
+	cmd.Flags().Float64Var(&sf.maxRate, "max-rate", 0,
+		"maximum events per second to emit (0 disables)")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -560,6 +982,9 @@ func newLedgersCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 
 Ledger metadata is large, so --compact is often what you want when watching
 for liveness rather than reading contents.
+
+With --pg-dsn the position is committed to PostgreSQL as the stream advances,
+so an interrupted run resumes where it stopped.
 
 With --state-file the position reached is recorded after every page, and a
 background pruner keeps that file from growing without bound. Add --resume to
@@ -594,6 +1019,7 @@ start the next run where the last one stopped.`,
 					ExpectedValidators: expected,
 				}), nil
 			}
+			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
@@ -631,10 +1057,6 @@ func runStream(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Ctrl-C ends the stream cleanly rather than killing it mid-record, so a
-	// partially written line never reaches a downstream consumer.
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	defer func() {
@@ -642,6 +1064,14 @@ func runStream(
 			err = cause
 		}
 	}()
+	if !g.skipNetworkCheck {
+		networkClient, ok := client.(rpc.NetworkClient)
+		if ok {
+			if err := rpc.ValidateNetwork(ctx, networkClient, g.network); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Diagnostics come from more than one goroutine: the stream reports
 	// retries and gaps, and the background cursor pruner reports what it
@@ -649,7 +1079,62 @@ func runStream(
 	// and so a test's stderr buffer cannot race.
 	stderr = newSyncWriter(stderr)
 
-	out, err := sf.newSink(stdout, g.color, func(err error) {
+	// --stats reports what the run did as the command exits. The reporter
+	// holds no goroutine and no timer: the phases feed it as they finish,
+	// and this deferred call — registered before every teardown below, so
+	// it runs last — prints the line after the drain, the cursor commit
+	// and the sink close. It prints nothing when the flag was not passed,
+	// or when the run failed before it started fetching.
+	var dedupOut *stream.DedupSink
+	// drainAbandoned records that the drain overran --drain-timeout and was
+	// left to its goroutine. The deferred report then skips the dedup sink
+	// — that goroutine may still be emitting through it — because the body
+	// already folded a snapshot taken before the goroutine started.
+	drainAbandoned := false
+	summary := newRunStats(sf.stats)
+	defer func() {
+		if !drainAbandoned {
+			summary.addDuplicates(dedupDropped(dedupOut))
+		}
+		summary.report(stderr)
+	}()
+
+	// Ctrl-C ends the stream cleanly rather than killing it mid-record, so a
+	// partially written line never reaches a downstream consumer. The signal
+	// stops the fetching; the drain at the end of the run flushes what is
+	// left and commits the final cursor before the process goes away.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case <-signals:
+			fmt.Fprintf(stderr, "prism: interrupted; draining for up to %s\n", sf.drainTimeout)
+			cancel(nil)
+		case <-ctx.Done():
+		}
+	}()
+
+	// A rewind moves the start point back, so the records in between are
+	// processed again. It is measured from the start the command resolved,
+	// which is --from when given and the server's head otherwise.
+	distance, hasRewind, err := sf.rewindDistance()
+	if err != nil {
+		return err
+	}
+	if hasRewind {
+		target, err := distance.Target(from)
+		if err != nil {
+			return fmt.Errorf("--rewind: %w", err)
+		}
+		if !sf.quiet {
+			fmt.Fprintf(stderr, "prism: rewinding %d ledgers back to ledger %d\n",
+				target.Back, target.Ledger)
+		}
+		from = target.Ledger
+	}
+
+	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	}, func(entry sink.DLQEntry) {
 		record := "-"
@@ -662,7 +1147,30 @@ func runStream(
 	if err != nil {
 		return err
 	}
+	if sf.statsBar {
+		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
+	}
+	if sf.sinks.metrics != nil {
+		if addr := sf.sinks.metrics.Addr(); addr != "" {
+			fmt.Fprintf(stderr, "prism: serving metrics on http://%s/metrics\n", addr)
+		}
+	}
 	localOut := out
+	// The output is closed exactly once, whether the run ends normally, is
+	// interrupted or fails: the drain closes it, and the deferred teardown
+	// closes it when the drain never ran. A second close would report a
+	// file that is already closed as an error.
+	var closeOutOnce once
+	closeOut := func() error {
+		if !closeOutOnce.claim() {
+			return nil
+		}
+		closer, ok := localOut.(io.Closer)
+		if !ok {
+			return nil
+		}
+		return closer.Close()
+	}
 	var shutdown func()
 	out, shutdown, err = startBroadcasts(ctx, g, out, stderr, cancel)
 	if err != nil {
@@ -672,20 +1180,19 @@ func runStream(
 		return err
 	}
 	defer shutdown()
-	if closer, ok := localOut.(io.Closer); ok {
-		defer func() {
-			// A failure to close the output is joined with whatever else
-			// went wrong rather than replacing it: two causes are more
-			// useful than one, and neither is worth losing.
-			err = errors.Join(err, closer.Close())
-		}()
-	}
+	defer func() {
+		// A failure to close the output is joined with whatever else
+		// went wrong rather than replacing it: two causes are more
+		// useful than one, and neither is worth losing.
+		err = errors.Join(err, closeOut())
+	}()
 
 	// The de-duplicator sits between the tailer and the output shaping, so
 	// a re-polled event is suppressed for every sink downstream — including
 	// a fanout directory — without any of them knowing about it.
 	if sf.dedupWindow > 0 {
-		out = stream.NewDedupSink(out, sf.dedupWindow)
+		dedupOut = stream.NewDedupSink(out, sf.dedupWindow)
+		out = dedupOut
 	}
 
 	if len(sf.topicPatterns) > 0 {
@@ -721,17 +1228,90 @@ func runStream(
 	if err != nil {
 		return err
 	}
-	defer func() {
+	var closeStateOnce once
+	closeState := func() error {
+		if !closeStateOnce.claim() {
+			return nil
+		}
 		// The context may already be cancelled by an interrupt, but the
 		// final compaction is local work that should still happen.
-		err = errors.Join(err, state.close(context.WithoutCancel(ctx)))
+		return state.close(context.WithoutCancel(ctx))
+	}
+	defer func() {
+		err = errors.Join(err, closeState())
 	}()
 
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
 	}
+	if sf.dryRun && opts.Filter != nil {
+		opts.Filter = dryRunFilter{next: opts.Filter, diagnostics: stderr}
+	}
 	opts.Process = sf.process
+
+	// The health server is started before the stream so the probes answer
+	// from the first moment, rather than only once the stream is running.
+	healthServer, health, err := startHealthServer(ctx, sf, stderr)
+	if err != nil {
+		return err
+	}
+	if healthServer != nil {
+		defer func() {
+			err = errors.Join(err, healthServer.Close())
+		}()
+	}
+	if health != nil {
+		onRetry := opts.OnRetry
+		opts.OnRetry = func(attempt int, delay time.Duration, retryErr error) {
+			// A failed call is proof that the endpoint did not answer.
+			health.SetRPCReachable(false)
+			if onRetry != nil {
+				onRetry(attempt, delay, retryErr)
+			}
+		}
+		onGap := opts.OnGap
+		opts.OnGap = func(event stream.GapEvent) {
+			health.SetGapped(true)
+			if onGap != nil {
+				onGap(event)
+			}
+		}
+		opts.OnProgress = func(progress stream.Progress) {
+			health.RecordProgress(progress)
+		}
+	}
+
+	// The lease makes this instance the leader or a standby. Only the leader
+	// fetches, so two instances sharing a state file never emit the same
+	// records twice.
+	election, err := leaderElection(ctx, sf, health, stderr)
+	if err != nil {
+		return err
+	}
+	if election != nil {
+		defer func() {
+			// Releasing the lease lets a standby take over at once
+			// instead of waiting out the TTL.
+			err = errors.Join(err, election.Close())
+		}()
+		opts.Leader = election
+		if state != nil {
+			// The cursor the previous leader committed is where this
+			// one picks the stream up.
+			opts.LeaderResume = func(resumeCtx context.Context) (string, error) {
+				meta, found, err := state.store.Latest(resumeCtx, state.key)
+				if err != nil {
+					return "", err
+				}
+				if !found {
+					return "", nil
+				}
+				return meta.Cursor, nil
+			}
+		}
+	}
+
 	// --since is an explicit position like --from, so it is resolved here and
 	// overrides whatever the caller passed.
 	since, err := sf.resolveSince(cmd, client, stderr)
@@ -741,6 +1321,30 @@ func runStream(
 	if since != 0 {
 		from = since
 	}
+
+	// Durable persistence is opt-in: only a DSN (flag or environment) opens
+	// anything, and without one no connection is ever attempted.
+	key := sf.derivedKey
+	if sf.pgCursorKey != "" {
+		key = sf.pgCursorKey
+	}
+	dsn := sf.pgDSN
+	if dsn == "" {
+		dsn = os.Getenv(envPGDSN)
+	}
+	store, closeStore, err := openCursorStore(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	if closeStore != nil {
+		defer func() {
+			if closeErr := closeStore(); closeErr != nil {
+				fmt.Fprintf(stderr, "prism: closing the PostgreSQL cursor store: %v\n", closeErr)
+			}
+		}()
+	}
+	opts.Store = store
+	opts.StoreKey = key
 
 	if state != nil {
 		// An explicit --from or --since wins over a recorded cursor: the
@@ -753,17 +1357,58 @@ func runStream(
 				fmt.Fprintf(stderr, "prism: recording cursor metadata: %v\n", recordErr)
 			}
 		}
+	} else if sf.stateFile != "" {
+		file, err := stream.OpenStateFile(sf.stateFile)
+		if err != nil {
+			return err
+		}
+		if sf.from != 0 {
+			saved, loadErr := file.Load()
+			if loadErr != nil {
+				return loadErr
+			}
+			if saved.Source == cmd.Name() && saved.PagingToken != "" {
+				fmt.Fprintf(stderr,
+					"prism: resuming the %s stream from %s (ledger %d); ignoring --from\n",
+					cmd.Name(), file.Path(), saved.Ledger)
+			}
+		}
+		opts.State = file
 	}
 
 	startFrom := from
 	if startFrom == 0 && opts.StartCursor == "" {
-		// Starting "now" means asking the server where now is; the
-		// RPC requires a concrete start ledger.
-		latest, err := latestLedger(ctx, client)
-		if err != nil {
-			return err
+		if opts.State != nil {
+			saved, err := opts.State.Load()
+			if err == nil && saved.PagingToken != "" && saved.Ledger != 0 {
+				startFrom = saved.Ledger
+			}
 		}
-		startFrom = latest
+		if startFrom == 0 {
+			// Starting "now" means asking the server where now is; the
+			// RPC requires a concrete start ledger.
+			latest, err := latestLedger(ctx, client)
+			if err != nil {
+				return err
+			}
+			startFrom = latest
+		}
+	}
+
+	// While following, the same distance can be asked for again at runtime:
+	// SIGUSR2 asks the stream to step back, and the records in between are
+	// processed a second time.
+	if hasRewind && sf.follow {
+		controller := stream.NewRewindController()
+		opts.Rewind = controller
+		opts.OnRewind = func(target stream.RewindTarget) {
+			if !sf.quiet {
+				fmt.Fprintf(stderr, "prism: rewound %d ledgers back to ledger %d\n",
+					target.Back, target.Ledger)
+			}
+		}
+		watcher := newRewindWatcher(ctx, notifyRewindSignals(), controller, distance, stderr)
+		defer watcher.Close()
 	}
 
 	if from > 0 && sf.backfillWorkers > 1 {
@@ -787,9 +1432,11 @@ func runStream(
 			return err
 		}
 
+		summary.start()
 		stats, err := drainer.Run(ctx)
+		summary.add(stats)
 		if err != nil {
-			return reportStreamError(err, stderr)
+			return reportStreamError(err, stderr, store, key)
 		}
 		if sf.limit > 0 {
 			remaining := sf.limit - stats.Emitted
@@ -813,17 +1460,101 @@ func runStream(
 	if err != nil {
 		return err
 	}
+
+	// --heartbeat prints a line on stderr whenever the follow loop waits
+	// an interval without delivering a record, so a quiet contract is
+	// distinguishable from a hung process. The beat is driven by slicing
+	// the tailer's own waits and by marking delivered pages, so it runs
+	// on the tailer's goroutine and holds nothing to clean up. The
+	// backfill above keeps the plain clock: its waits are fetch retries,
+	// not idle follow intervals.
+	if beat := newHeartbeat(sf.heartbeat, stderr); beat != nil {
+		clock := opts.Clock
+		if clock == nil {
+			clock = stream.RealClock{}
+		}
+		opts.Clock = &heartbeatClock{clock: clock, beat: beat}
+		onPage := opts.OnPage
+		opts.OnPage = func(page stream.Page) {
+			beat.mark()
+			if onPage != nil {
+				onPage(page)
+			}
+		}
+	}
+
 	tailer := stream.NewTailer(src, out, opts)
-	return reportStreamError(tailer.Run(ctx), stderr)
+	summary.start()
+	runErr := tailer.Run(ctx)
+
+	// The stream has stopped fetching, either because it finished or
+	// because it was interrupted. Everything it is still holding is
+	// flushed now, within the drain timeout, so the final cursor is
+	// committed before the process goes away.
+	//
+	// The counters are snapshotted before the drain is started: a drain
+	// that overruns the timeout is abandoned to its goroutine, which may
+	// still be emitting while the summary prints, so afterwards only a
+	// drain that completed — joined by runWithTimeout's receive — is read
+	// afresh.
+	stats := tailer.Stats()
+	dropped := dedupDropped(dedupOut)
+	// Capture sampling and rate limiting stats from the SampleFilter if present.
+	var sampled, rateLimited int
+	if filterSrc, ok := src.(*stream.SampleFilter); ok {
+		sampled = filterSrc.Sampled()
+		rateLimited = filterSrc.RateLimited()
+	}
+	drainErr := runWithTimeout(sf.drainTimeout, func() error {
+		var errs []error
+		if err := tailer.Drain(context.WithoutCancel(ctx), sf.drainTimeout); err != nil {
+			errs = append(errs, err)
+		}
+		if err := closeOut(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := closeState(); err != nil {
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
+	})
+	if drainErr != nil {
+		fmt.Fprintf(stderr, "prism: draining the stream: %v\n", drainErr)
+		if runErr == nil {
+			runErr = drainErr
+		}
+	}
+	if errors.Is(drainErr, errTimedOut) {
+		// Abandoned mid-drain: report the pre-drain snapshot rather
+		// than reading state the abandoned goroutine still owns, and
+		// let the deferred report skip the dedup sink for the same
+		// reason.
+		drainAbandoned = true
+		summary.add(stats)
+		summary.addDuplicates(dropped)
+	} else {
+		summary.add(tailer.Stats())
+	}
+	// Add sampled and rate limited counts to summary
+	if sampled > 0 || rateLimited > 0 {
+		summary.addSampled(sampled)
+		summary.addRateLimited(rateLimited)
+	}
+	return reportStreamError(runErr, stderr, store, key)
 }
 
-func reportStreamError(err error, stderr io.Writer) error {
+func reportStreamError(err error, stderr io.Writer, store stream.CursorStore, key string) error {
 	var gap *stream.GapError
 	if errors.As(err, &gap) {
 		fmt.Fprintf(stderr, "prism: %v\n", gap)
 		fmt.Fprintf(stderr,
 			"prism: restart with --from %d to resume from the oldest data the server still has\n",
 			gap.Oldest)
+		if store != nil {
+			fmt.Fprintf(stderr,
+				"prism: that starts a fresh stream with a new cursor row; the stale row for %q can be deleted\n",
+				key)
+		}
 		return &ExitCodeError{Code: 2, Message: gap.Error()}
 	}
 	return err

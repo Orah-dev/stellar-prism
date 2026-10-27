@@ -124,6 +124,12 @@ func normalizeSet(values []string, allowed ...string) (map[string]bool, error) {
 // Name implements Source.
 func (s *StorageChangeSource) Name() string { return "storage_changes" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *StorageChangeSource) Rewind(ledger uint32) {
+	s.query.StartLedger = ledger
+	s.tx.Rewind(ledger)
+}
+
 // CursorLedger implements Source.
 func (s *StorageChangeSource) CursorLedger(cursor string) (uint32, bool) {
 	return s.tx.CursorLedger(cursor)
@@ -197,6 +203,16 @@ func (s *StorageChangeSource) extract(record *Record) ([]Record, error) {
 			}
 			if !s.matches(payload) {
 				continue
+			}
+			if payload.EntryType == StorageEntryTTL && payload.EntryXDR != "" {
+				var entry xdr.LedgerEntry
+				if err := xdr.SafeUnmarshalBase64(payload.EntryXDR, &entry); err == nil && entry.Data.Ttl != nil {
+					payload.LiveUntilLedger = uint32(entry.Data.Ttl.LiveUntilLedgerSeq)
+					if payload.LiveUntilLedger > record.Sequence {
+						payload.RemainingTTL = payload.LiveUntilLedger - record.Sequence
+					}
+					payload.TTLWarning = payload.RemainingTTL < 1000
+				}
 			}
 
 			id := fmt.Sprintf("%010d-%06d-%06d", record.Sequence, tx.Index, len(records))

@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // withFake swaps the RPC constructor for one returning srv, restoring it when
@@ -100,6 +104,26 @@ func TestEventsCommandNDJSON(t *testing.T) {
 		if !bytes.Contains(rec.Value, []byte(`"type"`)) {
 			t.Errorf("line %d value is not a lens envelope: %s", i, rec.Value)
 		}
+	}
+}
+
+func TestEventsCommandDryRunHasNoOutputSideEffects(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(2100, 2), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+	path := filepath.Join(t.TempDir(), "records.ndjson")
+
+	stdout, stderr, err := run(t, "events", "--from", "2100", "--dry-run", "--output-file", path)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want no delivered records", stdout)
+	}
+	if !strings.Contains(stderr, "dry-run: match") {
+		t.Fatalf("stderr = %q, want dry-run diagnostics", stderr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("output file exists or stat failed: %v", err)
 	}
 }
 
@@ -318,6 +342,143 @@ func TestColorFlagMatchesLens(t *testing.T) {
 	}
 	if strings.Contains(never, "\x1b[") {
 		t.Error("--color never produced escape sequences")
+	}
+}
+
+// TestEventsCommandStateFileResumesAcrossRestarts is the end-to-end proof of
+// durable cursors: two independent CLI runs sharing nothing but a state file
+// must together deliver exactly the event universe — in order, with no gaps
+// and no duplicates — the way a restarted process would.
+func TestEventsCommandStateFileResumesAcrossRestarts(t *testing.T) {
+	events := fakerpc.MakeEvents(1000, 6)
+	srv := fakerpc.NewServer(events, fakerpc.WithPageLimit(3))
+	withFake(t, srv)
+
+	statePath := filepath.Join(t.TempDir(), "prism.state.json")
+
+	// First run: take two records and stop.
+	stdout1, _, err := run(t,
+		"events", "--from", "1000", "--json", "--state-file", statePath,
+		"--page-size", "3", "--limit", "2")
+	if err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+
+	// Second run: no --from, no limit. The state file must carry the
+	// position; nothing else links the two runs.
+	stdout2, _, err := run(t, "events", "--json", "--state-file", statePath, "--page-size", "3")
+	if err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+
+	var got []string
+	for _, line := range append(nonEmptyLines(stdout1), nonEmptyLines(stdout2)...) {
+		var rec struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("not valid JSON: %v\n%s", err, line)
+		}
+		got = append(got, rec.ID)
+	}
+
+	want := make([]string, 0, len(events))
+	for _, e := range events {
+		want = append(want, e.ID)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("delivered %d records across restarts, want %d\n got: %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("record %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// The file must end at the true final position, in the documented
+	// schema.
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("reading state file: %v", err)
+	}
+	var st stream.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("state file is not valid JSON: %v\n%s", err, data)
+	}
+	last := events[len(events)-1]
+	if st.Version != stream.StateVersion || st.Source != "events" ||
+		st.LastID != last.ID || st.PagingToken != last.ID ||
+		st.Ledger != uint32(last.Ledger) { //nolint:gosec // test data
+		t.Errorf("final state = %+v, want the position of event %q", st, last.ID)
+	}
+}
+
+// TestEventsCommandStateFileSaysSoWhenIgnoringFrom checks the precedence
+// rule is visible: a resumed run that also carries --from must announce that
+// the flag was overridden, not silently drop it.
+func TestEventsCommandStateFileSaysSoWhenIgnoringFrom(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(2000, 3), fakerpc.WithPageLimit(3))
+	withFake(t, srv)
+
+	statePath := filepath.Join(t.TempDir(), "prism.state.json")
+	if _, _, err := run(t,
+		"events", "--from", "2000", "--json", "--state-file", statePath, "--limit", "1"); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+
+	_, stderr, err := run(t,
+		"events", "--from", "2000", "--json", "--state-file", statePath)
+	if err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	for _, want := range []string{"resuming", "ignoring --from"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr does not mention %q\n%s", want, stderr)
+		}
+	}
+}
+
+// TestEventsCommandStateFileFailsFastOnCorruption checks a damaged state
+// file is reported before any streaming happens, rather than silently
+// restarting the stream from the top.
+func TestEventsCommandStateFileFailsFastOnCorruption(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(3000, 2), fakerpc.WithPageLimit(2))
+	withFake(t, srv)
+
+	statePath := filepath.Join(t.TempDir(), "prism.state.json")
+	if err := os.WriteFile(statePath, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("writing corrupt state file: %v", err)
+	}
+
+	_, _, err := run(t, "events", "--from", "3000", "--json", "--state-file", statePath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a state file failure")
+	}
+	if !strings.Contains(err.Error(), "not valid JSON") {
+		t.Errorf("error = %q, want it to report the parse failure", err)
+	}
+	if srv.Calls() != 0 {
+		t.Errorf("made %d RPC call(s) before rejecting the state file, want 0", srv.Calls())
+	}
+}
+
+// TestLedgersCommandStateFileFlagRegistered checks the shared --state-file
+// flag reaches the other streaming commands and produces a durable position
+// there too (the resume path itself is covered by the events tests above).
+func TestLedgersCommandStateFileFlagRegistered(t *testing.T) {
+	srv := fakerpc.NewLedgerServer(fakerpc.MakeLedgers(7000, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	statePath := filepath.Join(t.TempDir(), "prism.state.json")
+	stdout, _, err := run(t, "ledgers", "--from", "7000", "--json", "--state-file", statePath)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(nonEmptyLines(stdout)) != 1 {
+		t.Errorf("emitted %d lines, want 1\n%s", len(nonEmptyLines(stdout)), stdout)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Errorf("state file was not written: %v", err)
 	}
 }
 
@@ -629,5 +790,137 @@ func TestEventsCommandAdaptiveFlagRuns(t *testing.T) {
 	}
 	if got, want := len(nonEmptyLines(stdout)), 5; got != want {
 		t.Errorf("emitted %d records with --adaptive, want %d", got, want)
+	}
+}
+
+// safeBuffer is a buffer that may be read while a command is still writing
+// to it, which is what a test that interrupts a running command needs.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForOutput waits until the buffer holds want, or the test gives up.
+func waitForOutput(t *testing.T, b *safeBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(b.String(), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the output never contained %q\n%s", want, b.String())
+}
+
+// TestEventsCommandShutsDownCleanlyOnSignal covers the graceful drain: a
+// SIGTERM stops the fetching, the records still in memory are flushed, the
+// final cursor is committed, and the command exits cleanly.
+func TestEventsCommandShutsDownCleanlyOnSignal(t *testing.T) {
+	// The signal is delivered to this process, so its disposition is
+	// claimed before anything else happens: without a handler the runtime
+	// would terminate the test binary.
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, syscall.SIGTERM)
+	defer signal.Stop(interrupts)
+
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(1000, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	stdout := &safeBuffer{}
+	stderr := &safeBuffer{}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Execute([]string{
+			"events",
+			"--from", "1000",
+			"--json",
+			"--follow",
+			"--poll", "10ms",
+			"--state-file", stateFile,
+		}, stdout, stderr)
+	}()
+
+	// The first record proves the command is running, and therefore that
+	// its signal handler is already in place.
+	waitForOutput(t, stdout, `"ledger":1000`)
+
+	// Interrupt the run the way an orchestrator does.
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Execute() error = %v, want a clean shutdown", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the command did not stop after the signal")
+	}
+
+	// Every record the server had must be on stdout, and every line must
+	// be whole: a shutdown must not leave a half-written record behind.
+	lines := nonEmptyLines(stdout.String())
+	if len(lines) != 3 {
+		t.Errorf("stdout has %d records, want 3\n%s", len(lines), stdout.String())
+	}
+	for i, line := range lines {
+		var rec struct {
+			Kind   string `json:"kind"`
+			Ledger uint32 `json:"ledger"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Errorf("line %d is not valid JSON: %v\n%s", i, err, line)
+			continue
+		}
+		if rec.Kind != "event" {
+			t.Errorf("line %d kind = %q, want %q", i, rec.Kind, "event")
+		}
+	}
+
+	if !strings.Contains(stderr.String(), "draining") {
+		t.Errorf("stderr does not report the drain\n%s", stderr.String())
+	}
+
+	// The final cursor must be committed, or the next run starts over
+	// instead of where this one stopped.
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("reading the state file: %v", err)
+	}
+	var found bool
+	for _, line := range nonEmptyLines(string(data)) {
+		var meta struct {
+			Cursor string `json:"cursor"`
+			Ledger uint32 `json:"ledger"`
+		}
+		if err := json.Unmarshal([]byte(line), &meta); err != nil {
+			t.Errorf("the state file holds an unreadable entry: %v\n%s", err, line)
+			continue
+		}
+		if meta.Cursor != "" {
+			found = true
+			if meta.Ledger != 1002 {
+				t.Errorf("the committed cursor is at ledger %d, want 1002", meta.Ledger)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the state file holds no cursor\n%s", data)
 	}
 }

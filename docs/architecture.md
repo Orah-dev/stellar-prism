@@ -23,9 +23,9 @@ Everything below is in service of those four.
 
 ```
         ┌──────────┐   Batch    ┌────────┐   Record   ┌──────┐
-RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout
-        └──────────┘            └────────┘            └──────┘
-         events.go               tail.go               ndjson.go
+RPC ───►│  Source  ├───────────►│ Tailer ├───────────►│ Sink ├───► stdout,
+        └──────────┘            └────────┘            └──────┘     --timescale-dsn,
+         events.go               tail.go               ndjson.go   --parquet-dir
          ledgers.go            cursor, dedup,          human.go
          transactions.go       backoff, gaps           file_rotator.go
          storage_changes.go                          (via lens)
@@ -56,12 +56,17 @@ cmd/prism/            main; maps errors to exit codes
 internal/cli/         cobra commands — thin wrappers over pkg/stream
   color.go            --color parsing and NO_COLOR handling
   completion.go       bash/zsh/fish/powershell script generation
+  config.go           Viper-based configuration file resolution (~/.config/prism/config.yaml, .prism.yaml)
+  config_test.go      unit tests for config resolution
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
+  runtime.go          the health server, the lease and the state key source
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
+  stats.go            the --stats run summary, printed as the run exits
+  heartbeat.go        the --heartbeat liveness line for idle follows
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
-  health.go           periodic getHealth and ledger latency evaluation
+  wire_log.go         debug HTTP wire logger with credential redaction
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
@@ -83,14 +88,14 @@ pkg/stream/
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
   gap_recovery.go     GapStrategy, Rewinder and gap handling
-  pruning.go          CursorMetadata, MetadataStore, Pruner
-  cursor_store.go     file-backed cursor metadata journal
+  rewind.go           rewind distances, targets and the rewind controller
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
   demux.go            per-contract fan-out, queues + one goroutine each
   time_window.go      --since → approximate start ledger
   backoff.go          AdaptivePoller for --adaptive follow waits
+  state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
@@ -152,6 +157,69 @@ The RPC rejects a request carrying both a ledger range and a cursor
 enforces the same rule, so a regression here fails in tests rather than only
 in production.
 
+### Durable cursors
+
+By default a cursor lives only in the process, so restarting a stream starts it
+over from `StartLedger`. `--pg-dsn` moves that position into PostgreSQL, making
+a restart resume where the last run stopped:
+
+```go
+prism events tail --start-ledger 50000000 \
+    --pg-dsn "$PRISM_PG_DSN" --pg-cursor-key events/tendermint
+```
+
+With no `--pg-cursor-key`, prism derives one from the command and its tagged
+arguments (`events/tendermint` + start ledger → `events/<sha256-prefix>`), so
+two differently-configured streams sharing a database never share a row. Two
+runs pointed at the *same* key are two writers on one cursor; see the
+mutual-exclusion caveat below.
+
+The table is created on first use:
+
+```sql
+CREATE TABLE IF NOT EXISTS "prism_cursors" (
+    name       TEXT        PRIMARY KEY,
+    cursor     TEXT        NOT NULL,
+    last_id    TEXT        NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+)
+```
+
+`EnsureSchema` is a no-op when it already exists, so a role without `CREATE`
+can be given a pre-created table instead.
+
+**Why `SELECT … FOR UPDATE`.** Two processes writing one key must not
+interleave, or the cursor can move *backwards* and a later restart replays
+records that were already emitted. `PGCursorStore.Save` therefore takes the
+row's lock before writing:
+
+```sql
+SELECT name FROM prism_cursors WHERE name = $1 FOR UPDATE  -- the lock
+INSERT … ON CONFLICT (name) DO NOTHING                     -- only if absent
+UPDATE prism_cursors SET cursor = $2, … WHERE name = $1    -- the write
+```
+
+The lock is held to commit, so concurrent writers queue instead of racing.
+Waiting is bounded by a context deadline (`DefaultCursorLockTimeout`, 5s): a
+peer holding the lock for longer than that means something is wrong, and the
+save fails loudly rather than stalling a stream that looks hung.
+
+**Cost.** The tailer writes once per emitted record, so steady-state traffic is
+one round trip plus one small indexed row update per record — cheap next to the
+RPC fetch that produced it. Backfilling a large range at full speed does one
+write per record rather than per page; if that ever matters, the seam is the
+`CursorStore` interface, and batching per page is a bounded change.
+
+**What this does not give you.** Durable position is not exactly-once. A crash
+between emitting a record and persisting it replays that record, which is why
+de-duplication still runs after a restore — and why the `LastID` high-water mark
+is stored alongside the cursor. A second caveat: two processes writing one key
+take turns rather than merging, so run one tailer per key. `Save` deliberately
+does *not* detect a position moving backwards: a rewind is indistinguishable
+legitimately (an operator re-pointing a key) from a bug, and silently refusing
+to move would hide the operator's intent. Run one tailer per key and the
+question does not arise.
+
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
@@ -175,12 +243,127 @@ and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
 how many times a stream may skip ahead. A source without `Rewinder` cannot
 resume and fails exactly as it would under the default policy.
 
+### Durable cursors (`--state-file`)
+
+Exactly-once across restarts would need a transaction spanning the sink and
+the cursor store, which a CLI writing to stdout cannot have. What prism can
+have is much better than nothing, and `--state-file <path>` turns it on: the
+stream position is persisted after **every successfully emitted record**, so
+a restart resumes where the previous run stopped and the restart window
+narrows from "the whole run" to "one interrupted record".
+
+The position is one small, versioned JSON document (see
+`pkg/stream/state_file.go`):
+
+```json
+{"version":1,"source":"events","ledger":3966820,"paging_token":"…","last_id":"…","updated_at":"2026-10-20T12:00:00Z"}
+```
+
+Four rules carry the weight:
+
+**1. The file is written after the emit, never before.** It can therefore
+never run ahead of the stream: a crash between the two re-emits exactly the
+interrupted record on restart, and the restored high-water mark (`last_id`)
+suppresses anything the previous run already delivered.
+
+**2. Writes are atomic.** Each save writes a complete snapshot to a
+temporary file in the same directory, fsyncs it, and renames it over the
+destination, so a reader only ever sees a complete snapshot — the previous
+state or the new one, never a torn file. A crash before the rename reverts
+to the previous position, which can only re-emit, never skip: at-least-once
+holds unconditionally.
+
+**3. The saved position wins, visibly.** On startup the tailer resumes from
+the stored paging token, and the CLI notes on stderr when that overrides an
+explicit `--from`. A state file written by a different stream is refused
+rather than misapplied, and a token the Source cannot interpret fails the
+run before any request is made.
+
+**4. The restored high-water mark keeps de-duplication across the restart.**
+`last_id` is reloaded into the tailer, so a server that replays the tail of
+the stream to a freshly restarted client — which the RPC docs warn to expect
+— is still suppressed, exactly as within a single run.
+
+Persistence is synchronous and file-backed: no goroutines, no open
+descriptors between writes, nothing to clean up when the stream terminates
+or is interrupted. The cost is one small fsync per record, which is the
+price of the guarantee; a poll-only RPC keeps the record rate modest.
+
 ### Backpressure
 
 `Sink.Emit` is synchronous. A slow consumer (`prism … | jq | something-slow`)
 blocks the write, which blocks the poll loop. That is correct backpressure
-with no queue to grow. It is also why both sinks flush per record: a tail that
-buffers looks like a tail that has hung.
+with no queue to grow. It is also why the line-oriented sinks flush per
+record: a tail that buffers looks like a tail that has hung.
+
+## Sinks that store rather than print
+
+`NDJSON` and `Human` are line-oriented: a record is visible the moment `Emit`
+returns. The two storage sinks batch instead, because a round trip (or a file
+rename) per record would be absurd for a backfill. Both keep the same seam and
+the same delivery contract; the difference is that records are only durable
+once a batch is flushed.
+
+Both sinks own a background goroutine that flushes a partial batch every
+`--flush-interval`, and both implement `io.Closer`. The CLI closes whichever
+sink it built after the tailer returns — including on the gap error path — so
+the last records reach disk before the process exits and no goroutine outlives
+the run. `Flush` remains what the tailer calls; `Close` is the stronger command
+that also stops the timer and releases the driver.
+
+### TimescaleDB (`--timescale-dsn`)
+
+Rows land in one wide table, `prism_records`, with the neutral `Record` fields
+plus kind-specific columns left `NULL` where they do not apply, so a query can
+tell "no transaction here" from "a transaction that failed":
+
+```sql
+CREATE TABLE prism_records (
+  id TEXT NOT NULL, ledger BIGINT NOT NULL, kind TEXT NOT NULL,
+  closed_at TIMESTAMPTZ, hash TEXT, contract_id TEXT, tx_hash TEXT,
+  tx_index INTEGER, op_index INTEGER, successful BOOLEAN,
+  topics_xdr TEXT[], value_xdr TEXT, envelope_xdr TEXT,
+  result_xdr TEXT, result_meta_xdr TEXT, header_xdr TEXT, metadata_xdr TEXT,
+  PRIMARY KEY (id, ledger)
+);
+```
+
+The table is promoted to a hypertable partitioned by **ledger** — not by time —
+with a chunk every 50,000 ledgers. The ledger sequence is always present, is the
+natural dimension for chain data, and does not require inventing a timestamp for
+a record the server did not date. On a server without the extension the
+`create_hypertable` call is recognised as "TimescaleDB is not installed" and the
+sink keeps working against the plain table; anything else is reported.
+
+`COPY` cannot express `ON CONFLICT`, so a batch lands in a `pg_temp` table and
+is merged with `INSERT … ON CONFLICT DO NOTHING` inside one transaction. That
+matters for the delivery contract: a restart re-emits the last record or two by
+design, and the primary key would otherwise turn a legitimate replay into a
+fatal duplicate-key error. A failed batch therefore inserts nothing and stays
+buffered for retry, while a replayed batch is a no-op.
+
+### Parquet (`--parquet-dir`)
+
+An embedded DuckDB instance is used only as the Parquet encoder. Rows are staged
+in an in-memory table and copied out with `COPY (SELECT … ORDER BY id) TO …, so
+each flush produces one part file:
+
+```
+<dir>/part-000001.parquet
+<dir>/part-000002.parquet
+```
+
+Part files are written under a `.tmp` name and renamed, so an interrupted COPY
+cannot leave a truncated file that a later read would trust. Numbering resumes
+after the highest part already in the directory, so a restarted backfill appends
+rather than overwrites. The whole archive is one glob away:
+
+```sql
+SELECT kind, count(*) FROM read_parquet('parts/*.parquet') GROUP BY kind;
+```
+
+Batching bounds memory: the staging table never holds more than one part, so a
+multi-day backfill does not grow with the stream.
 
 `--batch` changes the unit of work, not the backpressure: `Batcher` buffers
 records until `--batch-size` is reached or `--batch-timeout` elapses, then
@@ -212,6 +395,38 @@ envelope `--json` prints, so a pattern tuned against `--json` output works
 unchanged here — and filtering lives at the sink seam rather than inside the
 tailer, so the delivery guarantee and cursor mechanics are untouched by
 output shaping.
+
+### Expression filter rules
+
+`--filter-expr` compiles a Go-like boolean expression once and evaluates it
+against every event through the `ruleEngine` in `internal/cli/rule_engine.go`.
+The engine is stateless: compilation happens before the stream starts, and
+`Match` is a pure function of the record. That keeps the evaluator offline-
+first and trivially testable without a network or a process.
+
+Supported context fields are `value`, `topics`, `contract`, `type`, `tx`,
+`ledger`, `txIndex` and `opIndex`. `value` and `topics` are decoded from XDR
+through lens, so `value.amount`, `topics[0].symbol` and nested map fields are
+all reachable. Operators follow Go syntax: arithmetic (`+`, `-`, `*`, `/`, `%`),
+comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean logic (`&&`, `||`, `!`),
+indexing (`topics[0]`) and parentheses.
+
+The rule engine wraps one or more compiled `stream.ExpressionFilter` predicates.
+Each predicate is matched in order; a record that any rule rejects is dropped,
+and a rule that errors on a particular record rejects it and reports the
+underlying reason through the returned error. An empty engine passes every
+event through.
+
+The CLI exposes `CompileRules(exprs ...string) (*ruleEngine, error)` for
+consumer code that prefers an explicit compile step. It trims whitespace and
+skips empty strings, so flag values with surrounding spaces are handled
+gracefully.
+
+| Added | Where |
+|---|---|
+| `ruleEngine`, `NewRuleEngine`, `CompileRules` | `internal/cli/rule_engine.go` |
+| `--filter-expr` | `prism events` |
+
 
 ### Per-contract fan-out
 
@@ -282,6 +497,10 @@ cancellation is a clean stop, not an error. `Drainer.Run` waits for every
 worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
 
+The rewind watcher in `internal/cli/rewind.go` is the only other goroutine the
+CLI starts. It owns a signal channel and nothing else: `Close` stops the
+signal delivery and waits for the goroutine to return, so a command that
+ends leaves nothing behind.
 
 ### What is deliberately *not* handled
 
@@ -312,119 +531,310 @@ single `rpc.Client`, so every command gains failover without knowing about it.
 Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
 `WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
 
-The pool's probe is a liveness check: it asks an unhealthy endpoint for its
-latest ledger and restores it when the call succeeds. It is not the latency
-checker described below. The two share the word "health" because both answer
-"is this endpoint usable?", but they run for different reasons and on different
-schedules.
+## Debug wire log (`--wire-log`)
 
-## RPC health checking (`pkg/rpc/health.go`)
-
-`prism health` evaluates an endpoint with a single `getHealth` call. It is
-useful as a CI gate, a cron probe, or a manual check when a stream looks stuck:
+When an RPC response does not match what the docs promised, the useful
+artefact is the exact HTTP exchange. `pkg/rpc/wire_log.go` provides
+`rpc.WireLogger`, an `http.RoundTripper` that records each request and response
+as one NDJSON object and then passes the exchange through unchanged.
+`rpc.NewWithTransport` installs it under the SDK client; `New` keeps its
+existing signature and behaviour.
 
 ```console
-$ prism health
-2026-10-21T12:00:00Z  healthy    status=healthy  latest=500  oldest=490  ledger-latency=1.2s  probe-latency=4ms  retention=17280
+$ prism events --from 3966000 --wire-log /tmp/prism-wire.ndjson
+$ jq -c 'select(.direction=="response") | {status, body}' /tmp/prism-wire.ndjson | head
 ```
 
-A check fails for any of four observable reasons:
-
-| Condition | Error | Meaning |
-|---|---|---|
-| `getHealth` returns an error | `rpc.ErrHealthCheckFailed` | the endpoint could not answer |
-| `status` is not `"healthy"` | `rpc.ErrUnhealthyStatus` | the server says it is not serving normally |
-| required fields are missing or inconsistent | `rpc.ErrInvalidHealthResponse` | the response cannot be evaluated |
-| latest ledger close time is too old | `rpc.ErrStaleLedger` | the endpoint has fallen behind the chain |
-
-The report carries the metrics the decision used:
-
-| Metric | Source | Meaning |
-|---|---|---|
-| `LedgerLatency` | `now - latestLedgerCloseTime` | staleness of the newest ledger |
-| `ProbeLatency` | duration of the `getHealth` call | RPC round-trip time |
-| `LatestLedger`, `OldestLedger`, `LedgerRetentionWindow` | `getHealth` | the retention bounds a stream would inherit |
-| `ConsecutiveFailures` | the checker | how many checks in a row have failed |
-
-`getHealth` is exposed as the optional `rpc.HealthClient` interface rather than
-as a method on `rpc.Client`. The streaming core never calls it, and widening
-the streaming interface would force every existing `Client` implementation and
-test double to grow a method it does not use. `SDKClient` and `stream.Pool`
-both implement it, so `--rpc-url` may be repeated and a failed endpoint fails
-over exactly like a streamed call.
-
-### Flags
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--follow` / `-f` | off | keep checking instead of exiting after one probe |
-| `--interval` | `30s` | delay between checks under `--follow` |
-| `--health-timeout` | `5s` | bound on a single `getHealth` request |
-| `--max-ledger-age` | `60s` | staleness limit for the latest ledger |
-| `--fail-after` | `0` | with `--follow`, exit 1 after N consecutive failures (0 keeps watching) |
-| `--json` | off | one JSON object per check, one per line |
-
-One probe exits 0 when healthy and 1 when not. `--follow` resets the failure
-count on a healthy result; `--fail-after` is what turns a watch into a gate.
-Ctrl-C is a clean stop and exits 0, because an operator stopping a watch is not
-an endpoint failure. The command validates every flag before opening a client,
-so a bad interval never reaches the network.
-
-### Goroutine ownership
-
-The checker owns at most one goroutine. `Start` launches it and returns;
-`Stop` cancels it and **waits** for it to return. Every `Stop` waits, not only
-the first, so a second caller cannot report the checker stopped while a probe
-is still in flight. `Run` is the `Start`/`Stop` pair for a blocking command,
-and `defer Stop` handles the early-return paths. A one-shot `Check` starts no
-goroutine at all.
-
-The loop checks immediately, then on a ticker. It checks the context before
-each probe, and suppresses the observer when cancellation races with a probe:
-Ctrl-C must not print a spurious "unhealthy" line. The CLI joins the checker
-before it returns, so an interrupted `prism health --follow` leaves nothing
-running.
-
-### Determinism and offline tests
-
-`NewHealthChecker` takes an injected `HealthClient` and an injectable clock
-(`WithHealthClock`); it never constructs a client or contacts an endpoint by
-itself. Unit tests therefore run with no network and no real sleeps:
-
-- `pkg/rpc/health_test.go` covers every classification branch, the latency
-  arithmetic, failure reset, context cancellation, observer delivery, and both
-  `Stop` invariants (join an in-flight probe, idempotent stop).
-- `internal/cli/health_test.go` exercises the command end to end against
-  `internal/fakerpc`: healthy JSON, human output, stale and unhealthy exits,
-  `--follow --fail-after`, clean cancellation, flag validation before any RPC
-  call, and a client without the optional capability.
-- `fakerpc.WithHealthResponse`, `WithHealthError` and `WithHealthScript` stage
-  real response sequences, including a final entry that repeats so a periodic
-  test terminates without timing guesswork.
-
-Mutation-checked, the same way as the streaming invariants:
-
-| Mutation | Result |
+| Flag | Meaning |
 |---|---|
-| Staleness check disabled | `TestHealthCheckerClassifiesFailures/stale_ledger` fails: `Check() = healthy, want a failure` |
-| `Stop` returns without joining the loop | `TestHealthCheckerStopWaitsForInFlightProbe` fails: `Stop() returned while a probe was still in flight` |
-| Consecutive failures never reset | `TestHealthCheckerResetsFailuresAfterSuccess` fails: `recovery = healthy=true failures=2, want healthy and 0` |
+| `--wire-log <path>` | append the debug NDJSON log to this file; `-` writes to stderr |
+| `--wire-log-max-body <bytes>` | cap each recorded body; `0` uses 1 MiB, `-1` disables bodies |
 
-### Compatibility
+Each line carries `time`, `direction` (`request`, `response`, or `error`),
+`method`, `url`, headers, status, duration and the body where applicable.
+Bodies are recorded as UTF-8 text when possible and base64 otherwise, with a
+`truncated` marker when the cap was reached.
 
-The feature is additive. `rpc.Client`, every existing command and every
-existing flag are unchanged. New exported surface:
+**Credentials are masked before the line is encoded.** The default redaction
+set is `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
+`X-Api-Key`, `X-Auth-Token` and `X-Amz-Security-Token`;
+`WireLogOptions.RedactHeaders` adds provider-specific names. URL userinfo
+(including basic-auth credentials) is replaced with `[REDACTED]`, as are
+values of credential-bearing query parameters such as `token` and `api_key`.
+Transport error text is scrubbed with the same values, because those messages
+often echo the URL that failed.
 
-| Added | Where |
+**The exchange is not altered.** Request bodies are read through a bounded
+prefix and rebuilt as a replay reader followed by the untouched remainder;
+response bodies use the same mechanism. The transport and the caller therefore
+see exactly the bytes they would have seen without the logger, and memory use
+is capped by `--wire-log-max-body` rather than by the response size.
+
+**There is no background writer.** The logger writes under one mutex and
+starts no goroutine, so there is nothing to join on Ctrl-C and no queue that
+can grow. `WireLogger.Close` is idempotent, flushes a writer that supports
+`Flush`, and returns the first logging failure. The CLI closes the RPC client
+first, so an in-flight failover probe cannot write to a closed file, then syncs
+and closes the log. A logging failure (a full disk, for example) is reported on
+stderr but never replaces the RPC result — debug output must not turn a working
+stream into a failing one.
+
+The logger makes no network calls of its own; it can only observe a request
+the SDK was already going to make. Unit tests cover redaction, truncation,
+body replay, writer and reader failures, and close idempotence. The integration
+test in `internal/cli` drives a real `httptest` RPC server through the CLI and
+asserts that the Authorization header and URL password are absent from the
+written log.
+
+## Active-passive high availability (`pkg/stream/ha.go`)
+
+A single prism instance is a single point of failure, and two instances
+streaming the same contract emit the same records twice and fight over the
+cursor file. `--ha-lease-file` makes a pair **active-passive**: the leader
+streams, the standby waits and takes over.
+
+Two mechanisms cooperate, because each covers a failure the other cannot.
+
+- **An advisory lock on the lease file** (`flock(2)`) is held for the whole of
+  a leader's term. The kernel drops it the moment the process dies, so a
+  crashed leader is replaced at once — no TTL to wait out.
+- **A lease record beside it** (`<path>.lease`) carries the holder, an
+  expiry and an **epoch**. It covers the case the lock cannot: a leader that
+  is alive but partitioned, and so neither renews nor exits. Its lease
+  expires, a standby fences it by claiming a higher epoch, and the old leader
+  notices on its next renewal that it has been replaced and stops.
+
+The epoch is the fencing token. It increases every time the lease changes
+hands, so a leader that was slow, paused or partitioned can tell that its
+term has ended and step down instead of continuing to emit alongside the new
+leader. The tailer compares the epoch on every poll: a change means the
+pages queued so far describe work the previous leader did, so they are
+dropped rather than committed, and the stream rewinds to the cursor the
+previous leader committed.
+
+```
+  leader                              standby
+  ──────                              ───────
+  flock(lease)  ──► held
+  write record {holder, epoch: 7, expires}
+                    renew every --ha-heartbeat
+                                         flock(lease)  ──► busy, lease live
+                                         ...lease expires...
+                                         write record {holder, epoch: 8}
+  renew ──► epoch 8 > 7, fenced
+  release the term                     flock(lease)  ──► held
+                                       write record {holder, epoch: 9}
+```
+
+The lease file must be on a file system that supports advisory locking (a
+shared NFS mount, for instance) so every instance sees the same lock. On a
+platform without `flock`, `lockFile` returns an error rather than pretending
+the lease works — the alternative would produce exactly the duplicate events
+the lease exists to prevent.
+
+A standby is alive but not ready: it is waiting for the lease, not serving.
+The health monitor is told about the change through the election's `OnChange`
+callback, so `/healthz` keeps answering 200 while `/readyz` answers 503.
+
+## Liveness and readiness probes (`pkg/stream/health.go`)
+
+`--health-port` serves the three endpoints a container orchestrator asks
+for. The state behind them is a `HealthMonitor`, fed by the tailer:
+
+| Endpoint | Answers |
 |---|---|
-| `rpc.HealthClient` | `pkg/rpc/health.go` |
-| `rpc.HealthChecker`, `rpc.NewHealthChecker`, `rpc.HealthReport`, `rpc.HealthOption` | `pkg/rpc/health.go` |
-| `rpc.WithHealthInterval`, `WithHealthTimeout`, `WithMaxLedgerAge`, `WithHealthClock`, `WithHealthObserver` | `pkg/rpc/health.go` |
-| `rpc.DefaultHealthCheckInterval`, `DefaultHealthCheckTimeout`, `DefaultMaxLedgerAge` | `pkg/rpc/health.go` |
-| `rpc.ErrHealthUnsupported`, `ErrHealthCheckFailed`, `ErrUnhealthyStatus`, `ErrStaleLedger`, `ErrInvalidHealthResponse`, `ErrInvalidHealthConfig`, `ErrHealthCheckerStarted` | `pkg/rpc/health.go` |
-| `SDKClient.GetHealth`, `Pool.GetHealth` | `pkg/rpc/client.go`, `pkg/stream/pool.go` |
-| `--follow`, `--interval`, `--health-timeout`, `--max-ledger-age`, `--fail-after`, `--json` | `prism health` |
-| `fakerpc.WithHealthResponse`, `WithHealthError`, `WithHealthScript`, `fakerpc.HealthBehaviour` | `internal/fakerpc` |
+| `/healthz` | 200 while the process is running and still making progress; 503 when it is stuck |
+| `/readyz` | 200 when the RPC is answering, the stream has not gapped, and the lag is within `--max-lag`; 503 otherwise |
+| `/metrics` | The same state in the Prometheus exposition format |
+
+The tailer reports progress after every successful fetch through
+`Options.OnProgress`, so the lag is the real distance between the stream's
+position and the server's head rather than a guess. A failed fetch marks the
+endpoint unreachable; a detected gap marks the stream gapped. Both make the
+stream not ready, because neither is a state a consumer should be sent into.
+
+Liveness is a staleness check: the monitor records when it was last updated,
+and a process that has not reported for `StaleAfter` (30s by default) is
+considered stuck. A standby is exempt — it is waiting for the lease, not
+wedged.
+
+## Runtime profiling (`--pprof-port`)
+
+`--pprof-port` starts the Go runtime's profiling HTTP server for the lifetime
+of the command:
+
+```sh
+prism events --contract CBGSB... --follow --pprof-port 6060
+# prism: serving pprof on http://127.0.0.1:6060/debug/pprof/
+```
+
+The server is bound to `127.0.0.1` deliberately: profiles expose memory
+contents and stack traces, so they must not be reachable from the network by
+default. The flag is a port rather than an address for the same reason.
+
+The endpoints are the standard library's `/debug/pprof/` set: `heap` and
+`allocs` for memory, `profile` for a CPU sample, `goroutine` for stacks, and
+`trace` for execution traces. For example:
+
+```sh
+# Heap profile, then inspect it with the Go toolchain
+curl -o heap.pprof 'http://127.0.0.1:6060/debug/pprof/heap'
+go tool pprof -top prism heap.pprof
+
+# A 30-second CPU profile
+go tool pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+```
+
+`cmd/prism/pprof.go` owns the server; `internal/cli` owns the flag and the
+lifecycle. The CLI starts it before the command's `RunE` and closes it when
+the command returns, using `http.Server.Shutdown` and then waiting for the
+serving goroutine, so Ctrl-C, a validation failure and a normal exit all leave
+nothing listening or running. `internal/cli.ProfilerFactory` is the seam: the
+binary supplies the real implementation, while tests use a fake to assert the
+flag wiring and cleanup without opening a socket.
+
+## Graceful drain (`Tailer.Drain`)
+
+On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
+the sinks and the state store a bounded window to finish:
+
+```sh
+prism events --follow --drain-timeout 15s
+```
+
+`Tailer.Drain(ctx, timeout)` writes out the records still held in the reorder
+buffer, flushes the sink and reports the pages that were delivered, which is
+what commits the final cursor. The timeout bounds the whole operation, and a
+drain that overruns it is reported rather than waited out: a process that is
+about to be killed cannot be helped by a longer flush.
+
+Two details make the drain safe rather than merely best-effort:
+
+- **Only one flush runs at a time.** `flushOutput` admits one flush through a
+  gate; a flush that overran its deadline is abandoned, and a second one
+  waits for it rather than starting alongside it. A sink that buffers would
+  otherwise write the same batch twice.
+- **The cursor is committed only for delivered pages.** A page that was
+  partly emitted is not reported, so a drain that fails half-way leaves the
+  cursor where it was and the next run re-emits the records that were not
+  delivered.
+
+The CLI runs the drain inside its own deadline and joins any error with the
+run's own, so a drain failure is reported rather than swallowed.
+
+## Run summary (`--stats`)
+
+Every streaming command accepts `--stats`, which prints one line on stderr as
+the command exits:
+
+```console
+$ prism events --from 1234567 --follow --stats
+...
+prism: stats: processed=1042 duplicates=7 retries=1 elapsed=2m3s
+```
+
+| Part | Meaning |
+|---|---|
+| `processed` | records handed to the sinks, summed over the backfill and follow phases |
+| `duplicates` | records dropped as duplicates: the tailer's high-water mark (`Stats.Duplicates`) plus the `--dedup-window` ring (`DedupSink.Dropped`) |
+| `retries` | fetches that failed and were retried |
+| `elapsed` | wall-clock time from the start of the run, rounded to milliseconds |
+
+Details:
+
+- **stderr, never stdout.** The summary is a diagnostic like every other
+  `prism:` line, so a piped `--json` stream is unaffected.
+- **Printed once, at the end.** Each phase contributes its `stream.Stats` as
+  it finishes; one deferred call prints after the drain, the cursor commit
+  and the sink close, so the numbers describe what actually reached the
+  sinks.
+- **Silent when there is nothing to summarise.** Without `--stats`, or when
+  the run fails before it starts fetching — a sink that cannot be built, an
+  unresolvable head — nothing is printed and the error stands alone.
+- **Nothing new to clean up.** `internal/cli/stats.go` is a plain struct the
+  run feeds; the reporter holds no goroutine and no timer. The one hazard is
+  counters owned by the *drain* goroutine: a drain that overruns
+  `--drain-timeout` is abandoned to it, so the summary reports snapshots
+  taken before it started — chosen with `errors.Is(drainErr, errTimedOut)` —
+  or a fresh read after a drain that completed and was joined.
+
+The flag is additive: a stream that does not ask for it prints exactly what
+it printed before.
+
+## Heartbeat (`--heartbeat`)
+
+A follow on a quiet contract is indistinguishable from a hung process unless
+something keeps saying the stream is alive. `--heartbeat` prints one line on
+stderr for every interval the stream waits without delivering a record:
+
+```console
+$ prism events --follow --heartbeat 30s
+prism: heartbeat: idle for 30s with no records
+prism: heartbeat: idle for 60s with no records
+```
+
+Details:
+
+- **Driven by the tailer's own waits.** `internal/cli/heartbeat.go` wraps
+  the injected `Clock` (`Options.Clock`), slicing each wait at the interval
+  so the beat lands *while* the stream waits — a line printed only after a
+  wait ends would say nothing about a process stuck inside one. The waits
+  are sliced rather than raced against a timer, so the beat needs no
+  goroutine of its own and there is nothing new to clean up at termination.
+- **Idle means idle.** The wrapped `OnPage` marks every page emitted in
+  full, restarting the window, so heartbeats never interrupt a busy stream
+  however long its polls take. The chain preserves what `OnPage` already
+  did — recording the cursor in `--state-file`.
+- **Follow only.** The backfill workers keep the plain clock: their waits
+  are fetch retries, not idle follow intervals, and `--heartbeat` without
+  `--follow` is rejected rather than silently ignored.
+- **Cancellation is unaffected.** Ctrl-C interrupts a wait at the next
+  slice boundary, with the wrapped clock's error passed through untouched.
+- **stderr, never stdout**, like every other `prism:` line, and only when
+  the flag is passed: a run that does not ask for it prints exactly what it
+  printed before.
+
+Retry backoffs pass through the wrapped clock too, so a long backoff may
+beat as well — which is honest: the process really is waiting, and the
+retry messages around it explain why.
+
+## Encrypted state files (`pkg/stream/crypto_state.go`)
+
+The cursor journal holds stream metadata, and on a shared file system or in a
+cloud bucket that is worth encrypting. `--state-passphrase-env` (or
+`--state-passphrase-file`, or a key management service) makes prism write an
+encrypted journal instead.
+
+The file is a header line followed by one envelope per entry:
+
+```
+{"version":1,"alg":"aes-256-gcm","key":{"kdf":"pbkdf2-hmac-sha256", ...}}
+{"version":1,"nonce":"...","ciphertext":"..."}
+```
+
+Each entry is sealed with authenticated **AES-256-GCM** under a fresh random
+nonce, with a fixed label as additional authenticated data so a ciphertext
+cannot be moved from one file into another. A file that was tampered with,
+truncated or written with a different key fails the authentication tag and is
+rejected with a clear error rather than being read as if it were intact.
+
+The key comes from exactly one place, decided by the flags and validated
+before anything is fetched. A passphrase is stretched into a key with
+PBKDF2-HMAC-SHA256 over a random salt, and the salt and iteration count are
+recorded in the header so the file stays readable by a future version; a key
+management service generates the data key and keeps the wrapped form, so the
+plaintext key never reaches the disk.
+
+| Source | Flag |
+|---|---|
+| Environment variable | `--state-passphrase-env NAME` |
+| File | `--state-passphrase-file PATH` |
+| AWS KMS | `--state-kms-provider aws --state-kms-key-id ARN` |
+| GCP KMS | `--state-kms-provider gcp --state-kms-key-id NAME` |
+
+Passing more than one source is an error rather than a silently ignored flag:
+an operator who believes the file is encrypted with a passphrase must never
+end up with a file encrypted with something else.
 
 ## Derived transaction streams
 
@@ -475,6 +885,42 @@ NDJSON consumers to identify hot keys and transaction sets.
 for each newly observed head, decodes Soroban resource estimates, and compares
 successive return values through stellar-xdr-lens before emitting changed
 fields.
+
+### Transaction cursors, IDs and backfill
+
+`getTransactions` resembles `getEvents` with a different payload, but its
+pagination is not the same, and two details decide whether the source is
+correct:
+
+**The cursor is a SEP-35 total-order ID, not a ledger sequence.** It is one
+decimal string encoding the ledger, the transaction's application order within
+that ledger and an operation index into a single int64. `transactionCursorLedger`
+parses it through `toid.Parse`; reading it as a plain ledger number produces a
+value around 10^13, which is larger than any retention floor, so
+`cursorLedger < batch.Oldest` never becomes true and gap detection silently
+stops working. `TestTransactionTailDetectsRetentionGap` is the regression test
+for exactly that failure.
+
+**There is no per-record ID from the server.** The events API returns one;
+transactions expose only a ledger and an application order, so the source
+synthesises `%010d-%07d` from them. Ten digits covers the ledger, and seven is
+the width of TOID's transaction field, so the fixed-width contract holds for a
+whole ledger's worth of transactions rather than only the first 10,000.
+
+Two smaller behaviours follow from the real server:
+
+- The server caps how many *ledgers* one call scans. A short page that has not
+  yet reached `LatestLedger` therefore means "more is waiting", not "the
+  stream is done"; `transactionPageIsFull` keeps a backfill draining instead of
+  ending it mid-range. An empty page stays terminal, because the cursor cannot
+  advance past nothing.
+- An unparseable cursor is wrapped with `rpc.Permanent`, so a corrupt position
+  fails immediately instead of exhausting the retry budget and reporting the
+  wrong cause.
+
+The `internal/fakerpc` and `pkg/prismtest` doubles return the same decimal
+TOID cursor the real server does. A fake whose cursors merely looked plausible
+would let a broken `CursorLedger` pass every test.
 
 ### Transaction classification (`prism transactions`)
 
@@ -643,67 +1089,74 @@ compressed). Rotation is synchronous; the active file is reopened before
 pruning, so a failed prune cannot stop the stream. `--rotate-*` without
 `--output-file` is rejected.
 
-## Dead letter queue (`--dlq-file`)
+## Rewinding the stream (`--rewind`)
 
-A long-running tail must not die because one record is malformed or one write
-fails. `--dlq-file` wraps the chosen sink in `sink.DLQ`, which records the
-failure and keeps the stream running:
+A stream's cursor is the position it has reached. `--rewind` steps it back so
+the records in between are processed again — the manual escape hatch for "the
+event I need was just before where I was looking".
 
-```
-                      ┌──────────────┐
-   Tailer ── Record ─►│ sink.DLQ     ├──► chosen sink ──► stdout / --output-file
-                      │              │
-                      │   failure    ├──► --dlq-file (NDJSON, append)
-                      └──────────────┘
+```console
+$ prism events --contract CDLZF...CYSC --rewind 500 --follow
+prism: rewinding 500 ledgers back to ledger 3966312
 ```
 
-The wrapper implements both `stream.Sink` and `stream.BatchSink`, so every
-streaming command gains it without knowing it exists.
+The distance is either a count of ledgers (`500`, `500l`) or a duration
+(`45s`, `30m`, `2h`, `1h30m`, `7d`). A duration is converted with
+`NominalLedgerInterval` — five seconds, roughly one ledger close — so it
+lands near the requested point rather than exactly on it.
 
-| Field | Meaning |
+### Where the step is measured from
+
+The step is measured from the start the command resolved: `--from` when it is
+given, and the server's head otherwise. So `--from 3966000 --rewind 500`
+starts at ledger 3965500, and `--rewind 500` on its own starts 500 ledgers
+before the head.
+
+A step that would reach before the first ledger is clamped to it rather than
+rejected: "as far back as the chain goes" is a request, not a mistake. The
+clamp is reported, because a rewind that quietly landed somewhere else would
+be worse than one that did not happen.
+
+### Rewinding a running stream
+
+While following, `SIGUSR2` asks for the same step again. The signal is only
+handled while `--rewind` is in effect; without it, `SIGUSR2` keeps its usual
+meaning and terminates the process. The signal is handled by one goroutine
+that owns nothing but the request (`internal/cli/rewind.go`); the tailer
+applies it at the next page boundary, so a request never lands in the middle
+of a page.
+
+### What a rewind does to the guarantee
+
+A rewind re-emits the records between the old and the new position. That is
+the point of it, and it is the only way a record is emitted twice within a
+single run: the de-duplication mark is reset along with the cursor, because
+the records being reprocessed are exactly the ones the mark would suppress.
+
+A rewind that lands before the server's retention window is a gap, and it is
+reported like any other: the tailer compares the rewind target with the
+server's oldest retained ledger and returns a `*GapError`, so the run exits
+2 rather than continuing with a hole in the stream. Under
+`--gap-strategy resume` the usual recovery applies and the missed range is
+announced.
+
+### The pieces
+
+`pkg/stream/rewind.go` holds the logic:
+
+| Symbol | Role |
 |---|---|
-| `kind` | always `"dlq"`, so a queue file is distinguishable from stream NDJSON |
-| `stage` | `validation`, `delivery` or `flush` |
-| `error` | the failure that prevented delivery |
-| `failedAt` | UTC timestamp, injectable through `DLQOptions.Now` |
-| `record` | the original record, preserved field-for-field; absent for `flush` |
+| `ParseRewind` | parses `500` or `30m` into a `RewindDistance` |
+| `RewindDistance.Ledgers` | converts a distance into ledgers |
+| `RewindDistance.Target` | computes where a step lands, clamping at the first ledger |
+| `RewindController` | hands a request to the tailer, safely |
+| `RewindRequest` | the request itself: a distance and an optional anchor |
 
-Two classes of failure are captured:
-
-- **Validation.** `sink.ValidateRecord` checks the structural contract every
-  sink relies on: a non-empty ID, a known `Kind`, and a payload pointer that
-  matches that kind. It deliberately does *not* reject XDR that lens cannot
-  decode — the built-in sinks already report that inline, and treating a
-  display problem as a delivery failure would be wrong.
-- **Delivery.** If the wrapped sink's `Emit` returns an error, the record is
-  written to the queue and the error is swallowed. Only a failure to write the
-  dead letter itself is returned, because at that point the record would vanish
-  with no trace. A primary `Flush` failure is captured as a `flush` entry for
-  the same reason: the per-record failures are already accounted for, and
-  failing the command at shutdown would defeat the queue's purpose.
-
-A captured record counts as delivered, so the tailer advances its cursor past
-it. The queue is the durable copy: replay its `record` field through a sink if
-the primary output must be complete. This is deliberate — blocking the cursor
-on a record the primary can never write would stall the stream forever — and
-it is why the queue is append-only and flushed per entry.
-
-`EmitBatch` validates and delivers one record at a time. A batch sink can fail
-part-way through a batch, after some records were written, so forwarding the
-whole batch again would duplicate them and forwarding nothing would lose them.
-Per-record isolation is what makes every failure attributable; the trade-off
-is that a DLQ-wrapped run does not amortise the wrapped sink's flushes. The
-batcher still controls when the tailer hands records over.
-
-The DLQ starts no goroutines. `Close` flushes the queue, closes the wrapped
-sink when it implements `io.Closer`, and closes the queue writer (when
-`CloseWriter` is set) — so `Ctrl-C`, a failed run and a normal exit all leave
-nothing open behind. It is idempotent, and each `Close` performs the flush it
-needs rather than returning early.
-
-`--dlq-file` is append-only and must differ from `--output-file`. Without
-`--dlq-file` the sink chain is unchanged: nothing is opened and no wrapper is
-inserted.
+The controller is the seam: whoever asks for the rewind — a flag, a signal
+handler — and the tailer, which is the only goroutine allowed to move a
+cursor, meet there. A request carrying an explicit anchor is measured from
+that anchor; one without is measured from the stream's own position, which
+is the cursor it reached or the last record it emitted.
 
 ## Testing the guarantee
 
@@ -725,34 +1178,53 @@ pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
 flushes, and task-group cancellation. Gap recovery is also unit-tested
-without a network through the `Rewinder` seam.
-
-The cursor metadata store is tested the same way: appends and rewrites
-against a real file in a temporary directory, a pruner that keeps running
-after a failure, a pruner whose goroutine is joined rather than abandoned,
-and a tailer that resumes from a recorded cursor and is still gap-checked
-when it does. `internal/cli` runs the whole thing end to end against
-`internal/fakerpc`: a run that records checkpoints, a file that stays
-bounded while the stream runs, and a second run that picks up where the
-first stopped.
-
-The same guarantees also hold through the seams this file describes below:
-adaptive poll waits, `--since` window arithmetic, client-side topic
-patterns, and demux routing under concurrent submitters — all checked with
-`go test -race`.
-
-The dead letter queue is covered at both levels. `pkg/sink` tests every
-validation branch, delivery and flush failures (including a writer that
-fails like a full disk), batch attribution, and idempotent close against a
-real file. `internal/cli` runs `runStream` with a source that emits one valid
-record and one malformed record, then asserts that the valid record reached
-stdout, the malformed one reached `--dlq-file`, and the command exited
-successfully — the end-to-end shape of "a bad record does not crash a tail".
+without a network through the `Rewinder` seam. Rewinding is covered the same
+way: a rewind applied mid-stream, in a follow loop, against a source that
+cannot be repositioned, and across the retention window.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
 CI — a distinction worth the few extra lines.
+
+### End-to-end tests against a real network
+
+Offline determinism is the right default, so the live suite is opt-in twice
+over: it lives behind the `e2e` build tag and skips unless `PRISM_E2E=1` is
+set. `make test-e2e` runs it.
+
+```
+internal/cli/e2e_test.go                     the scenarios
+internal/cli/testdata/e2e/docker-compose.yml a local Quickstart node
+```
+
+`TestMain` brings up `stellar/quickstart` (standalone network, Soroban RPC
+enabled), waits for it to report a ledger, runs the tests and tears the
+container down. Point `PRISM_E2E_RPC_URL` at an existing node to skip the
+container entirely; `PRISM_E2E_FRIENDBOT_URL` overrides friendbot, which is
+otherwise derived from the RPC URL.
+
+What it proves that the fake cannot: real cursor paging and real XDR. Each
+test funds a fresh account through friendbot, which submits a genuine
+`createAccount` transaction, and waits until the node can serve it — a freshly
+started node ingests a ledger into the RPC store a moment after it closes, so
+asserting immediately would race the ingester rather than test prism.
+
+- `prism transactions --from <ledger>` returns the submitted hash, with valid
+  NDJSON, strictly increasing IDs and no duplicates;
+- `prism tx <hash>` explains a real envelope/result pair;
+- `prism ledgers` and `--backfill-workers` work against the paginated API;
+- cancelling `--follow` returns cleanly and leaves no goroutine behind.
+
+Cancellation is timed rather than triggered by the first record, because the
+tailer holds the newest ledger's records until a later ledger proves they are
+final; on a quiet local network a head record can legitimately wait.
+Termination is what that test owns, and delivery under traffic is covered by
+the offline suite.
+
+Nothing here runs in CI by default: it needs Docker and a network, and a
+flaky testnet would make CI untrustworthy. Run it before a release or when
+touching the RPC adapter.
 
 ### Mutation-checked
 
@@ -762,18 +1234,53 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
-| Checkpoint written before the page was emitted | `TestTailDoesNotReportAPartiallyEmittedPage` and `TestTailDoesNotReportAPageTheSinkRejected` fail |
-| Pruner goroutine abandoned instead of joined | `TestPrunerCloseJoinsItsGoroutine` fails: `Close()` returned while the pruner was still running |
-| Second `Close` returning without joining the goroutine | `TestPrunerConcurrentCloseWaitsForTheGoroutine` fails: `Close() returned (<nil>) while the pruner was still running` |
-| Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
-| Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
-| Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
-| DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
-| DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
-| DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
+| De-duplication mark not reset on a rewind | `TestTailAppliesRewind` and `TestTailRewindsWhileFollowing` fail with exact diagnostics |
+| Source not repositioned on a rewind | `TestTailAppliesRewind` fails in 0.00s |
+| Retention check after a rewind disabled | `TestTailRewindReportsRetentionGap` fails in 0.00s |
+| Retention check after a rewind applied to every later page | `TestTailRewindChecksRetentionOnlyOnce` fails in 0.00s |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
+
+## Performance benchmarks (`pkg/stream/bench_test.go`)
+
+The streaming core has an offline benchmark suite sized around the documented
+operational target of 50,000 events per second:
+
+```sh
+make bench
+# or:
+go test -run '^$' -bench 'FiftyThousandEvents' -benchmem ./pkg/stream
+```
+
+Each benchmark iteration processes a 50,000-event corpus through a real code
+path; the reported `events/op` makes the scale explicit, and the custom
+`events/s`, `allocs/event` and `bytes/event` metrics avoid having to divide
+`allocs/op` by hand. The suite covers:
+
+| Benchmark | What it measures |
+|---|---|
+| `BenchmarkTailerFiftyThousandEvents/raw` | the tailer, reorder buffer and sink seam end to end |
+| `BenchmarkTailerFiftyThousandEvents/dedup` | the same path with the `--dedup-window` sink enabled |
+| `BenchmarkDedupSinkFiftyThousandEvents` | fingerprinting plus the bounded de-duplication ring |
+| `BenchmarkReorderBufferFiftyThousandEvents` | per-ledger sorting and release |
+| `BenchmarkEventKeyFiftyThousandEvents` | the de-duplication key itself |
+
+The benchmarks use a fixed in-memory source and no wall-clock waits, so they
+make no network calls and produce the same record IDs on every run. `TestStreamingFiftyThousandEvents`
+runs the same corpus as an ordinary integration test: it asserts that every
+record was delivered exactly once, that throughput clears the 50,000 events/s
+target (with a lower floor under the race detector, whose overhead is not a
+property of the stream), that allocation stays under the per-event budget, and
+that the run leaves no goroutine behind. The test logs the measured throughput
+and allocation so a regression is visible even when it stays inside the
+budget.
+
+On the reference CI machine the raw tailer path is well above the target
+(roughly 1.4M events/s in a normal build, ~370 bytes/event); the dedup path is
+roughly 0.7M events/s at ~423 bytes/event. These numbers are diagnostics, not
+contracts — the contract is the test's 50,000 events/s floor and allocation
+ceiling.
 
 ## Relationship to stellar-xdr-lens
 
@@ -870,10 +1377,213 @@ type Sink interface {
 }
 ```
 
-Flush per record if the sink is for live viewing. Decode XDR through `lens`
-rather than reaching for `xdr` directly, so output stays consistent with the
-rest of the family — and report an undecodable payload inline rather than
+Flush per record if the sink is for live viewing. A batching sink should also
+implement `io.Closer`, stop and wait for any goroutine it started, and flush
+whatever is buffered there; the CLI closes the sink it built. Decode XDR through
+`lens` rather than reaching for `xdr` directly, so output stays consistent with
+the rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
+
+### Built-in sinks
+
+Every streaming command accepts the same optional output flags. They are off
+unless set, so the default path still touches nothing but RPC and stdout. When
+one or more are enabled, `pkg/sink.MultiSink` delivers each record to the
+normal output and every extra sink. It records acknowledgements per sink, so a
+retry does not repeat a delivery that already succeeded; any unresolved
+failure ends the stream rather than silently dropping records. `Close` flushes buffered
+batches, stops timers and closes listeners and sockets, so a finished stream
+leaves nothing running.
+
+All extra sinks reuse `sink.MarshalRecord`, so the JSON object is byte-for-byte
+what `--json` writes to stdout. With `--raw` the base64 XDR fields are kept
+instead of decoded values.
+
+#### Webhook (`--webhook-url`, `pkg/sink/webhook.go`)
+
+Batches records into one request body:
+
+```json
+{"delivery":"1700000123456789-1","sentAt":"2023-11-14T22:15:23Z",
+ "records":[{"kind":"event","id":"..."}]}
+```
+
+Headers: `Content-Type: application/json`, `X-Prism-Delivery` (the idempotency
+key), `X-Prism-Timestamp` (Unix seconds) and, when a secret is configured,
+`X-Prism-Signature: sha256=<hex>`. The signature is
+`HMAC-SHA256(secret, "<timestamp>.<body>")`; receivers must verify it before
+trusting a payload. The secret comes from `--webhook-secret` or
+`PRISM_WEBHOOK_SECRET`.
+
+Batching flushes at `--webhook-batch-size` records or `--webhook-timeout`
+after the first buffered record, and on exit. Failures retry with exponential
+backoff from 100ms to 5s, ±20% jitter, honouring `Retry-After`; a 4xx other
+than 408/425/429 is treated as permanent. A failed batch stays buffered, so a
+later flush or close retries it: delivery is at-least-once, not exactly-once.
+
+#### Object storage (`--cloud-*`, `pkg/sink/cloud_storage.go`)
+
+Records are accumulated in memory and uploaded as one object when the chunk
+reaches `--cloud-batch-records`, `--cloud-batch-bytes`, or
+`--cloud-batch-timeout`. The key is derived only from the records:
+
+```
+<prefix>/<YYYY>/<MM>/<DD>/ledger-<start>-<end>/<firstID>-<lastID>.ndjson[.gz]
+```
+
+A retry therefore overwrites the same object instead of duplicating a chunk,
+and a backfill lands in the partition of the ledger's close date rather than
+the upload date. `--cloud-compress` (default on) gzips the body and sets
+`application/gzip`; otherwise it is `application/x-ndjson`. One record larger
+than the byte cap is uploaded alone rather than split.
+
+The `ObjectStore` interface is the seam, so chunking is tested with an
+in-memory store and no network:
+
+- **S3** (`pkg/sink/s3.go`): SigV4-signed `PUT` using
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional
+  `AWS_SESSION_TOKEN`. Path-style addressing by default, `--cloud-region`
+  defaults to `us-east-1`. The signer is checked against AWS's published PUT
+  example in the unit tests.
+- **GCS** (`pkg/sink/gcs.go`): the JSON API's simple media upload (`POST
+  /upload/storage/v1/b/<bucket>/o?uploadType=media&name=<key>`) with a bearer
+  token from `GOOGLE_OAUTH_ACCESS_TOKEN`.
+
+Uploads retry like the webhook and keep the chunk buffered on failure.
+
+#### Prometheus (`--metrics-addr`, `pkg/sink/prometheus.go`)
+
+Serves `/metrics` on the configured address with:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `prism_records_total{kind}` | counter | records emitted |
+| `prism_events_total{type}` | counter | Soroban events by type |
+| `prism_errors_total{stage}` | counter | `rpc` retries, `gap` recoveries, `sink` failures |
+| `prism_ledger_latency_seconds` | histogram | ledger close to emission, default buckets |
+| `prism_ledger_sequence` | gauge | highest ledger emitted |
+
+The exposition text is rendered directly rather than through the Prometheus
+client, keeping the CLI dependency-free. The server binds before the stream
+starts; `:0` chooses a port, which the CLI prints on stderr. Shutdown waits for
+in-flight scrapes and leaves no goroutine behind.
+
+#### Syslog and journald (`--syslog-address`, `pkg/sink/syslog.go`)
+
+`--syslog-format rfc5424` writes one newline-terminated message per record:
+
+```
+<134>1 2023-11-14T22:15:23.000Z host prism - event [prism@32473 kind="event" ledger="100" id="..."] {"kind":"event",...}
+```
+
+Severity follows the record: failed transactions and deployments are warnings
+(4), diagnostic events are debug (7), everything else is informational (6).
+Structured-data values escape `\`, `"` and `]` per RFC 5424.
+
+`--syslog-format journald` writes the journald native protocol instead: a
+`NAME=value` block with `PRIORITY`, `SYSLOG_IDENTIFIER`, `SYSLOG_FACILITY`,
+`PRISM_KIND`, `PRISM_LEDGER`, `PRISM_RECORD_ID`, `PRISM_LEDGER_TIME` and
+`MESSAGE`, terminated by a blank line. Use `unixgram:///run/systemd/journal/socket`
+as the address. `DialSyslog` also accepts `unix://`, `udp://`, `tcp://` and a
+bare socket path; `--syslog-facility` accepts any POSIX facility name and
+defaults to `local0`.
+
+#### Elasticsearch/OpenSearch (`--sink-es-url`, `pkg/sink/elasticsearch.go`)
+
+Records are written through the bulk API in NDJSON pairs: an `index` action
+followed by the same JSON document emitted by `--json`. The record ID is the
+Elasticsearch document ID, so retrying a buffered batch overwrites the same
+documents rather than creating duplicates. `--sink-es-index` is the base name;
+the actual index is `<base>-YYYY.MM.DD`, derived from each record's UTC close
+time. `--sink-es-batch-size` and `--sink-es-flush-interval` bound the in-memory
+batch. Authenticate with `--sink-es-api-key` (or `PRISM_ES_API_KEY`) or basic
+credentials.
+
+#### NATS and JetStream (`--sink-nats`, `pkg/sink/nats.go`)
+
+Each record is published as the regular `--json` document to a subject rendered
+from `--nats-subject`; the template may use `.ContractID`, `.Topic0`, `.ID` and
+`.Ledger`. The default is `stellar.events.{{.ContractID}}`. A rendered subject
+must contain nonempty publish tokens. Core NATS flushes after each publish;
+`--nats-jetstream` waits for a JetStream publish acknowledgement.
+
+#### ZeroMQ PUB (`--sink-zmq`, `pkg/sink/zeromq.go`)
+
+The ZeroMQ sink connects a PUB socket to `--sink-zmq` and sends each record as
+a multipart `[topic, JSON]` message. `--zmq-topic` uses the same template data
+as `--nats-subject`, which gives subscribers an efficient prefix-filterable
+first frame. PUB delivery is intentionally best-effort: a slow or disconnected
+subscriber can miss messages under ZeroMQ's high-water-mark semantics. Use
+NATS JetStream when publisher acknowledgements are required.
+
+#### Audit trail (`--sink-audit`, `pkg/sink/audit_log.go`)
+
+The audit sink writes a trail that shows whether it was changed after the fact.
+Every record is hashed together with the hash of the record before it:
+
+```
+Hash_n = SHA256(Hash_{n-1} + Record_n)
+```
+
+The chain starts at a genesis hash computed over the header, so the header
+cannot be swapped for another one without breaking every record that follows.
+Each record is written as one JSON line holding the sequence number, the
+ledger, the record id and kind, the previous hash, the new hash and the record
+itself — the same document `--json` writes, so an auditor reads the trail
+without a second decoder.
+
+Editing, deleting or inserting a line changes every hash after it, and the
+verifier names the line of each anomaly. On top of the chain, a checkpoint is
+written every `--sink-audit-checkpoint` records (100 by default, 0 writes one
+after every record) and signed with an Ed25519 key:
+
+```
+Signature = Ed25519(SigningKey, Hash_n)
+```
+
+The signature covers the chain hash at that point, so a trail that was edited
+and re-hashed from the beginning still fails to verify against the checkpoints
+written before the edit. The signing key is the PEM private key at
+`--sink-audit-key`, or `<audit file>.key` when the flag is left out; it is
+created exclusively with mode `0600` the first time it is needed, so two
+processes cannot each write a key and leave the trail signed by one of them.
+
+The trail is append-only across runs: a new sink reads the header, checks it
+against the signing key and continues the chain from the last entry. A log
+signed with a different key is refused rather than appended to. A final line
+left half-written by an interrupted run is truncated before the chain
+continues, so an audit log is never left with a dangling entry.
+
+`prism audit-verify` (`internal/cli/audit.go`) recomputes the chain, checks
+every signed checkpoint against the chain it covers and against the public key
+in the header, and reports each anomaly with its line:
+
+| Anomaly | Meaning |
+|---|---|
+| `modified` | the record hash does not match the record |
+| `deleted` | the sequence numbers skip ahead |
+| `inserted` | the sequence numbers go back, or the log holds a second header |
+| `chain_break` | the record does not link to the entry before it |
+| `checkpoint_mismatch` | the checkpoint does not match the chain it covers |
+| `bad_signature` | the checkpoint signature does not verify |
+| `key_mismatch` | the trail is signed with another key than the one expected |
+| `header_mismatch` | the header was changed or is not supported |
+
+The command exits 0 when the trail is intact and 1 when it was tampered with.
+`--public-key` pins the key the trail must be signed with, and
+`--print-public-key` prints the key the trail carries, so it can be pinned
+somewhere the trail cannot reach.
+
+#### Configuration rules
+
+Secrets are read from the environment wherever possible, because command-line
+flags are visible in process listings. `--webhook-secret` exists for trusted
+shells; the cloud adapters only read credentials from the environment.
+
+`--batch` composes with these sinks: the batcher wraps the fanout, so stdout
+and every destination receive whole batches. The webhook and cloud sinks also
+cap their own in-memory batches, so a large stream cannot grow memory without
+bound even when `--batch` is not used.
 
 ## Adding an RPC method
 

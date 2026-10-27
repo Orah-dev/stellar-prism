@@ -44,6 +44,9 @@ type DLQEntry struct {
 
 // DLQOptions configures a DLQ.
 type DLQOptions struct {
+	// MaxRecordRetries retries a failed delivery before quarantining it. Zero
+	// preserves the immediate-quarantine behaviour.
+	MaxRecordRetries int
 	// Now supplies the FailedAt timestamp. Tests inject a fixed clock; nil
 	// means time.Now.
 	Now func() time.Time
@@ -209,12 +212,18 @@ func (d *DLQ) emitLocked(r stream.Record) error {
 		return d.recordLocked(r, DLQStageValidation, err)
 	}
 
-	if err := d.primary.Emit(r); err != nil {
+	var err error
+	for attempt := 0; attempt <= d.opts.MaxRecordRetries; attempt++ {
+		err = d.primary.Emit(r)
+		if err == nil {
+			d.stats.Delivered++
+			return nil
+		}
+	}
+	if err != nil {
 		d.stats.Failed++
 		return d.recordLocked(r, DLQStageDelivery, err)
 	}
-
-	d.stats.Delivered++
 	return nil
 }
 

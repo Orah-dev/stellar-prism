@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
 
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
+	prismpb "github.com/stellar-optics/stellar-prism/proto"
 )
 
 // serve reuses the event command's RPC filters and cursor lifecycle.
@@ -29,8 +31,8 @@ func newServeCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	}
 	run := cmd.RunE
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		if g.serveSSE == "" && g.serveWS == "" {
-			return fmt.Errorf("serve requires --sse or --ws")
+		if g.serveSSE == "" && g.serveWS == "" && g.serveGRPC == "" {
+			return fmt.Errorf("serve requires --sse, --ws or --serve-grpc")
 		}
 		return run(cmd, args)
 	}
@@ -75,6 +77,7 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 	}
 	var servers []*http.Server
 	var listeners []net.Listener
+	var grpcServers []*grpc.Server
 	cleanup := func() {
 		for _, e := range endpoints {
 			if err := e.close(); err != nil {
@@ -90,6 +93,9 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 		}
 		for _, listener := range listeners {
 			_ = listener.Close()
+		}
+		for _, server := range grpcServers {
+			server.GracefulStop()
 		}
 	}
 	combined := &broadcastOutput{next: out}
@@ -107,6 +113,24 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 		go func() {
 			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				cancel(fmt.Errorf("broadcast server: %w", err))
+			}
+		}()
+	}
+	if g.serveGRPC != "" {
+		listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", g.serveGRPC)
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("grpc listen %s: %w", g.serveGRPC, err)
+		}
+		grpcSink := sink.NewGRPCSink()
+		server := grpc.NewServer()
+		prismpb.RegisterPrismStreamServer(server, grpcSink)
+		listeners = append(listeners, listener)
+		grpcServers = append(grpcServers, server)
+		combined.broadcasts = append(combined.broadcasts, grpcSink)
+		go func() {
+			if err := server.Serve(listener); err != nil {
+				cancel(fmt.Errorf("grpc server: %w", err))
 			}
 		}()
 	}

@@ -30,6 +30,15 @@ go test -race ./...
 golangci-lint run ./...
 ```
 
+There is one deliberate exception to the offline rule: an end-to-end suite
+that runs prism against a real local network. It is behind the `e2e` build tag
+and skipped unless `PRISM_E2E=1` is set, so neither `go test ./...` nor CI
+picks it up. Run it when you touch the RPC adapter or the streaming loop:
+
+```sh
+make test-e2e    # starts a Quickstart container, streams, then removes it
+```
+
 Install the linter if you need it:
 
 ```sh

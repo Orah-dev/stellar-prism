@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package prism.v1;
+
+option go_package = "github.com/stellar-optics/stellar-prism/proto;prismpb";
+
+// PrismStream exposes typed event and ledger subscriptions.
+service PrismStream {
+  rpc StreamEvents(EventRequest) returns (stream EventResponse);
+  rpc StreamLedgers(LedgerRequest) returns (stream LedgerResponse);
+}
+
+message EventRequest { string contract_id = 1; }
+message LedgerRequest { uint32 from_ledger = 1; }
+message EventResponse { string id = 1; uint32 ledger = 2; int64 closed_at_unix_ms = 3; bytes record_json = 4; }
+message LedgerResponse { string id = 1; uint32 ledger = 2; int64 closed_at_unix_ms = 3; bytes record_json = 4; }
