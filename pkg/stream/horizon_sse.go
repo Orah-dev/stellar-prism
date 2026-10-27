@@ -2,15 +2,16 @@ package stream
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
-
-	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
-
-	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 )
 
 // DefaultHorizonSSEPageLimit is the page size requested for Horizon SSE streams.
@@ -37,18 +38,21 @@ type HorizonSSEQuery struct {
 // This provides a secondary stream of classic Stellar transactions and operations
 // via Horizon's SSE endpoint, complementing the Soroban RPC event streams.
 type HorizonSSESource struct {
-	client      *http.Client
-	horizonURL  string
-	eventTypes  []string
-	startLedger uint32
-	pageLimit   uint
-	reconnect   time.Duration
+	client       *http.Client
+	horizonURL   string
+	eventTypes   []string
+	startLedger  uint32
+	pageLimit    uint
+	reconnect    time.Duration
 	lastSequence uint32
-	connected   bool
+	connected    bool
 }
 
 // NewHorizonSSESource returns a Source over the given Horizon URL.
 func NewHorizonSSESource(client *http.Client, q HorizonSSEQuery) *HorizonSSESource {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	if q.PageLimit == 0 {
 		q.PageLimit = DefaultHorizonSSEPageLimit
 	}
@@ -58,7 +62,7 @@ func NewHorizonSSESource(client *http.Client, q HorizonSSEQuery) *HorizonSSESour
 
 	return &HorizonSSESource{
 		client:      client,
-		horizonURL:  q.HorizonURL,
+		horizonURL:  strings.TrimRight(q.HorizonURL, "/"),
 		eventTypes:  q.EventTypes,
 		startLedger: q.StartLedger,
 		pageLimit:   q.PageLimit,
@@ -81,16 +85,9 @@ func (s *HorizonSSESource) CursorLedger(cursor string) (uint32, bool) {
 	if cursor == "" {
 		return 0, false
 	}
-	// Horizon SSE cursors are in the format "ledger-sequence"
+	// Horizon SSE cursors are in the format "ledger-sequence" or just a ledger sequence
 	parts := strings.Split(cursor, "-")
-	if len(parts) != 2 {
-		return 0, false
-	}
 	ledger, err := strconv.ParseUint(parts[0], 10, 32)
-	if err != nil {
-		return 0, false
-	}
-	sequence, err := strconv.ParseUint(parts[1], 10, 32)
 	if err != nil {
 		return 0, false
 	}
@@ -100,12 +97,12 @@ func (s *HorizonSSESource) CursorLedger(cursor string) (uint32, bool) {
 // Fetch implements Source - for Horizon SSE, this initiates the SSE connection
 // and returns the initial batch of events.
 func (s *HorizonSSESource) Fetch(ctx context.Context, cursor string) (Batch, error) {
-	// Build the SSE request URL
-	url := s.horizonURL + "/events"
+	endpoint := s.horizonURL + "/events"
 
-	// Build query parameters
 	params := url.Values{}
-	if s.startLedger > 0 {
+	if cursor != "" {
+		params.Set("cursor", cursor)
+	} else if s.startLedger > 0 {
 		params.Set("start_ledger", fmt.Sprintf("%d", s.startLedger))
 	}
 	if s.pageLimit > 0 {
@@ -115,10 +112,12 @@ func (s *HorizonSSESource) Fetch(ctx context.Context, cursor string) (Batch, err
 		params.Add("types", et)
 	}
 
-	fullURL := url + "?" + params.Encode()
+	fullURL := endpoint
+	if len(params) > 0 {
+		fullURL += "?" + params.Encode()
+	}
 
-	// Create the SSE connection
-	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
 		return Batch{}, fmt.Errorf("creating SSE request: %w", err)
 	}
@@ -134,39 +133,33 @@ func (s *HorizonSSESource) Fetch(ctx context.Context, cursor string) (Batch, err
 		return Batch{}, fmt.Errorf("SSE server returned status %d", resp.StatusCode)
 	}
 
-	// Parse SSE events from the response
 	batch := Batch{
-		Records:    make([]Record, 0),
-		NextCursor: "",
-		Latest:     s.startLedger,
-		Oldest:     s.startLedger,
-		Full:       false,
+		Records: make([]Record, 0),
+		Latest:  s.startLedger,
+		Oldest:  s.startLedger,
+		Full:    false,
 	}
 
-	// Read and parse events
 	decoder := NewSSEDecoder(resp.Body)
-	for {
-		event, err := decoder.Read()
-		if err == io.EOF {
+	for uint(len(batch.Records)) < s.pageLimit {
+		event, readErr := decoder.Read()
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
-		if err != nil {
-			// Connection error or malformed event, stop reading
+		if readErr != nil {
 			break
 		}
 
-		// Parse the event data
 		record := parseHorizonSSEEvent(event)
 		if record != nil {
 			batch.Records = append(batch.Records, *record)
-			// Update the last known sequence
+			batch.NextCursor = event.ID
 			if record.Sequence > s.lastSequence {
 				s.lastSequence = record.Sequence
 			}
 		}
 	}
 
-	// Sort records by ID
 	sort.Slice(batch.Records, func(i, j int) bool {
 		return batch.Records[i].ID < batch.Records[j].ID
 	})
@@ -176,10 +169,10 @@ func (s *HorizonSSESource) Fetch(ctx context.Context, cursor string) (Batch, err
 
 // SSEEvent represents a single Server-Sent Event.
 type SSEEvent struct {
-	ID     string
-	Data   string
-	Event  string
-	Retry  *int
+	ID    string
+	Data  string
+	Event string
+	Retry *int
 }
 
 // SSEDecoder reads Server-Sent Events from an io.ReadCloser.
@@ -200,21 +193,23 @@ func (d *SSEDecoder) Read() (*SSEEvent, error) {
 		return nil, io.EOF
 	}
 
-	// Read until we find a complete event (double newline)
 	for {
-		// Look for the start of an event
-		if len(d.buffer) > 0 && d.buffer[0] == '\n' {
-			d.buffer = d.buffer[1:]
+		if idx := strings.Index(string(d.buffer), "\n\n"); idx >= 0 {
+			eventBuf := string(d.buffer[:idx])
+			d.buffer = d.buffer[idx+2:]
+			if event, ok := d.parseEvent(eventBuf); ok {
+				return event, nil
+			}
+			continue
 		}
 
-		// Try to read more data
 		b := make([]byte, 4096)
 		n, err := d.reader.Read(b)
+		if n > 0 {
+			d.buffer = append(d.buffer, b[:n]...)
+		}
 		if err != nil {
-			if n > 0 {
-				d.buffer = append(d.buffer, b[:n]...)
-			}
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				d.closed = true
 				if len(d.buffer) > 0 {
 					event, ok := d.parseEvent(string(d.buffer))
@@ -227,169 +222,100 @@ func (d *SSEDecoder) Read() (*SSEEvent, error) {
 			}
 			return nil, err
 		}
-		d.buffer = append(d.buffer, b[:n]...)
-
-		// Check if we have a complete event
-		if strings.Contains(string(d.buffer), "\n\n") {
-			event, ok := d.parseEvent(string(d.buffer))
-			if ok {
-				d.buffer = nil
-				return event, nil
-			}
-			// Keep buffering
-		}
 	}
 }
 
-// parseEvent parses a single SSE event from the buffer.
 func (d *SSEDecoder) parseEvent(buf string) (*SSEEvent, bool) {
-	// SSE events have the format:
-	// event: <id>
-	// data: <data>
-	// event: <name>
-	// data: <data>
-	// : <comment>
-	// \n\n
-
-	lines := strings.SplitN(buf, "\n\n", 2)
-	if len(lines) != 2 {
-		return nil, false
-	}
-
-	headerPart := lines[0]
-	dataPart := lines[1]
-
 	event := &SSEEvent{}
+	lines := strings.Split(buf, "\n")
+	var dataLines []string
 
-	// Parse headers
-	lines := strings.Split(headerPart, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
 		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
 		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
+		var val string
+		if len(parts) == 2 {
+			val = strings.TrimSpace(parts[1])
+		}
 
 		switch key {
 		case "id":
-			event.ID = value
+			event.ID = val
 		case "event":
-			event.Event = value
+			event.Event = val
 		case "data":
-			event.Data = value
+			dataLines = append(dataLines, val)
 		case "retry":
-			if n, err := atoi(value); err == nil {
+			if n, err := strconv.Atoi(val); err == nil {
 				event.Retry = &n
 			}
 		}
 	}
 
-	// Data can contain newlines within JSON, so join data lines
-	if event.Data != "" {
-		// The data part may have newlines that are part of the JSON
-		event.Data = strings.ReplaceAll(dataPart, "\n", "")
-	}
-
+	event.Data = strings.Join(dataLines, "\n")
 	if event.ID == "" && event.Data == "" {
 		return nil, false
 	}
-
 	return event, true
 }
 
-// atoi parses a string to an integer.
-func atoi(s string) (int, error) {
-	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
-}
-
-// parseHorizonSSEEvent parses a Horizon SSE event into a Record.
 func parseHorizonSSEEvent(event *SSEEvent) *Record {
 	if event.ID == "" && event.Data == "" {
 		return nil
 	}
 
-	// Parse the data as JSON
 	var evt map[string]interface{}
-	if err := parseJSON(event.Data, &evt); err != nil {
-		// Try as a simple text event
+	if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
 		return nil
 	}
-
-	// Extract relevant fields
-	// Horizon SSE events typically contain: id, p, tx, lp, t, etc.
-	recordID, _ := evt["id"].(string)
-	// p is the previous ledger sequence
-	// tx is the transaction hash
-	// lp is the ledger sequence
-	// t is the transaction type
 
 	var recordID64 uint64
 	if id, ok := evt["id"].(float64); ok {
 		recordID64 = uint64(id)
-	} else if id, ok := evt["id"].(string); ok {
-		// Parse the ID
-		parseID := func(s string) (uint64, error) {
-			var n uint64
-			_, err := fmt.Sscanf(s, "%d", &n)
-			return n, err
-		}
-		if n, err := parseID(id); err == nil {
+	} else if idStr, ok := evt["id"].(string); ok {
+		if n, err := strconv.ParseUint(idStr, 10, 64); err == nil {
 			recordID64 = n
 		}
 	}
 
-	// Get the ledger sequence
 	var ledgerSeq uint64
-	if lp, ok := evt["lp"].(float64); ok {
+	if lp, ok := evt["ledger_sequence"].(float64); ok {
 		ledgerSeq = uint64(lp)
-	} else if lp, ok := evt["lp"].(string); ok {
-		parseLP := func(s string) (uint64, error) {
-			var n uint64
-			_, err := fmt.Sscanf(s, "%d", &n)
-			return n, err
-		}
-		if n, err := parseLP(lp); err == nil {
+	} else if lp, ok := evt["lp"].(float64); ok {
+		ledgerSeq = uint64(lp)
+	} else if lpStr, ok := evt["lp"].(string); ok {
+		if n, err := strconv.ParseUint(lpStr, 10, 64); err == nil {
 			ledgerSeq = n
 		}
 	}
 
-	// Get the transaction hash
 	var txHash string
-	if tx, ok := evt["tx"].(string); ok {
+	if tx, ok := evt["transaction_hash"].(string); ok {
+		txHash = tx
+	} else if tx, ok := evt["tx"].(string); ok {
 		txHash = tx
 	}
 
-	// Get the transaction type
-	var eventType string
-	if t, ok := evt["t"].(string); ok {
-		eventType = t
-	} else if t, ok := evt["type"].(string); ok {
-		eventType = t
-	}
-
-	// Get the ledger close time
-	var ledgerCloseTime uint64
-	if tc, ok := evt["tc"].(float64); ok {
-		ledgerCloseTime = uint64(tc)
-	}
-
-	// Decode the timestamp
 	var closed time.Time
-	if ledgerCloseTime > 0 {
-		// Horizon timestamps are typically seconds since epoch
-		closed = time.Unix(int64(ledgerCloseTime), 0).UTC()
+	if createdAt, ok := evt["created_at"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
+			closed = t.UTC()
+		}
+	} else if tc, ok := evt["tc"].(float64); ok && tc > 0 {
+		closed = time.Unix(int64(tc), 0).UTC()
 	}
 
-	// Build the record
+	id := event.ID
+	if id == "" {
+		id = fmt.Sprintf("%010d-%010d", ledgerSeq, recordID64)
+	}
+
 	return &Record{
-		ID:       fmt.Sprintf("%019d-%010d", ledgerSeq, recordID64),
+		ID:       id,
 		Sequence: uint32(ledgerSeq),
 		Time:     closed,
 		Kind:     KindTransaction,
@@ -397,114 +323,4 @@ func parseHorizonSSEEvent(event *SSEEvent) *Record {
 			Hash: txHash,
 		},
 	}
-}
-
-// parseJSON attempts to parse a string as JSON into the target value.
-func parseJSON(data string, v interface{}) error {
-	// Simple JSON parser for Horizon event format
-	// This is a minimal implementation; a full parser would use encoding/json
-	decoder := NewJSONDecoder(strings.NewReader(data))
-	return decoder.Decode(v)
-}
-
-// JSONDecoder is a minimal JSON decoder for Horizon event parsing.
-type JSONDecoder struct {
-	reader *strings.Reader
-	pos    int
-	len    int
-}
-
-// NewJSONDecoder creates a new JSON decoder from a string.
-func NewJSONDecoder(r *strings.Reader) *JSONDecoder {
-	return &JSONDecoder{reader: r, len: r.Len()}
-}
-
-// Decode reads the next JSON value from the reader.
-func (d *JSONDecoder) Decode(v interface{}) error {
-	// Skip whitespace
-	for d.pos < d.len && (d.reader.Data()[d.pos] == ' ' || d.reader.Data()[d.pos] == '\t' || d.reader.Data()[d.pos] == '\n' || d.reader.Data()[d.pos] == '\r') {
-		d.pos++
-	}
-
-	if d.pos >= d.len {
-		return fmt.Errorf("unexpected end of JSON")
-	}
-
-	// Parse the value
-	return d.parseValue(v)
-}
-
-// parseValue parses a JSON value.
-func (d *JSONDecoder) parseValue(v interface{}) error {
-	// Look at the current character
-	if d.pos >= d.len {
-		return fmt.Errorf("unexpected end of JSON")
-	}
-
-	c := d.reader.Data()[d.pos]
-
-	switch c {
-	case '{':
-		return d.parseObject(v)
-	case '[':
-		return d.parseArray(v)
-	case '"':
-		return d.parseString(v)
-	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-':
-		return d.parseNumber(v)
-	case 't':
-		return d.parseTrue(v)
-	case 'f':
-		return d.parseFalse(v)
-	case 'n':
-		return d.parseNull(v)
-	default:
-		return fmt.Errorf("unexpected JSON character: %c", c)
-	}
-}
-
-// parseObject parses a JSON object.
-func (d *JSONDecoder) parseObject(v interface{}) error {
-	// ... (simplified for brevity)
-	// In a full implementation, this would parse key-value pairs
-	return nil
-}
-
-// parseArray parses a JSON array.
-func (d *JSONDecoder) parseArray(v interface{}) error {
-	// ... (simplified for brevity)
-	return nil
-}
-
-// parseString parses a JSON string.
-func (d *JSONDecoder) parseString(v interface{}) error {
-	// ... (simplified for brevity)
-	return nil
-}
-
-// parseNumber parses a JSON number.
-func (d *JSONDecoder) parseNumber(v interface{}) error {
-	// ... (simplified for brevity)
-	return nil
-}
-
-// parseTrue parses a JSON true value.
-func (d *JSONDecoder) parseTrue(v interface{}) error {
-	*v = true
-	d.pos += 4 // "true"
-	return nil
-}
-
-// parseFalse parses a JSON false value.
-func (d *JSONDecoder) parseFalse(v interface{}) error {
-	*v = false
-	d.pos += 5 // "false"
-	return nil
-}
-
-// parseNull parses a JSON null value.
-func (d *JSONDecoder) parseNull(v interface{}) error {
-	*v = nil
-	d.pos += 4 // "null"
-	return nil
 }

@@ -32,24 +32,11 @@ type LedgerMetaQuery struct {
 // This source provides detailed close metadata including consensus diagnostics,
 // transaction set hashes, and close deltas between consecutive ledgers.
 type LedgerMetaSource struct {
-	client             rpc.Client
-	query              LedgerMetaQuery
-	previousSequence   uint32
-	previousCloseTime  uint64
-	cached               map[uint32]*ConsensusMetrics
-}
-
-// ConsensusMetrics holds the decoded consensus value and close delta metrics
-// for a ledger close, as extracted from the ledger close metadata.
-type ConsensusMetrics struct {
-	// CloseTime is the timestamp when the ledger was closed.
-	CloseTime uint64
-	// CloseDeltaSeconds is the seconds between this ledger close and the previous one.
-	CloseDeltaSeconds *int64
-	// Warnings contains any warnings about the close, such as latency spikes.
-	Warnings []string
-	// ValueSigners lists the signers of the close value.
-	ValueSigners []string
+	client            rpc.Client
+	query             LedgerMetaQuery
+	previousSequence  uint32
+	previousCloseTime uint64
+	cached            map[uint32]*ConsensusMetrics
 }
 
 // NewLedgerMetaSource returns a Source over the given RPC client.
@@ -111,32 +98,35 @@ func (s *LedgerMetaSource) Fetch(ctx context.Context, cursor string) (Batch, err
 	for _, l := range resp.Ledgers {
 		r := ledgerMetaRecord(l)
 		if s.query.Consensus {
-			m, ok := consensusMetrics(l.LedgerHeader)
-			if m.Error == "" {
-				if s.previousSequence != 0 && s.previousSequence+1 == l.Sequence {
-					delta := int64(m.CloseTime) - int64(s.previousTime)
-					m.CloseDeltaSeconds = &delta
-					if delta > 10 {
-						m.Warnings = append(m.Warnings, "consensus latency spike: close delta exceeds 10s")
-					}
-					if delta < 0 {
-						m.Warnings = append(m.Warnings, "ledger close time moved backwards")
-					}
-				}
-				for _, expected := range s.query.ExpectedValidators {
-					found := false
-					for _, signer := range m.ValueSigners {
-						if expected == signer {
-							found = true
+			m, ok := s.cached[l.Sequence]
+			if !ok {
+				m = consensusMetrics(l.LedgerHeader)
+				if m.Error == "" {
+					if s.previousSequence != 0 && s.previousSequence+1 == l.Sequence {
+						delta := int64(m.CloseTime) - int64(s.previousCloseTime)
+						m.CloseDeltaSeconds = &delta
+						if delta > 10 {
+							m.Warnings = append(m.Warnings, "consensus latency spike: close delta exceeds 10s")
+						}
+						if delta < 0 {
+							m.Warnings = append(m.Warnings, "ledger close time moved backwards")
 						}
 					}
-					if !found {
-						m.Warnings = append(m.Warnings, "expected value signer not observed: "+expected)
+					for _, expected := range s.query.ExpectedValidators {
+						found := false
+						for _, signer := range m.ValueSigners {
+							if expected == signer {
+								found = true
+							}
+						}
+						if !found {
+							m.Warnings = append(m.Warnings, "expected value signer not observed: "+expected)
+						}
 					}
-				}
-				if l.Sequence > s.previousSequence {
-					s.previousSequence = l.Sequence
-					s.previousTime = m.CloseTime
+					if l.Sequence > s.previousSequence {
+						s.previousSequence = l.Sequence
+						s.previousCloseTime = m.CloseTime
+					}
 				}
 			}
 			r.Close.Consensus = m
@@ -164,27 +154,4 @@ func ledgerMetaRecord(l protocol.LedgerInfo) Record {
 			MetadataXDR: l.LedgerMetadata,
 		},
 	}
-}
-
-// consensusMetrics extracts consensus metrics from a ledger header.
-// This is the same logic used in ledgers.go for consensus diagnostics.
-func consensusMetrics(header protocol.LedgerHeader) *ConsensusMetrics {
-	m := &ConsensusMetrics{}
-
-	// Extract the close time from the header
-	if header.CloseTime != 0 {
-		m.CloseTime = uint64(header.CloseTime)
-	}
-
-	// Extract value signers
-	if header.ValueSigners != nil {
-		for _, signer := range header.ValueSigners {
-			m.ValueSigners = append(m.ValueSigners, signer.Address())
-		}
-	}
-
-	// Calculate close delta if we have a previous sequence
-	// (this would be tracked by the caller)
-
-	return m
 }
